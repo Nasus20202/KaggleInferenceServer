@@ -65,9 +65,7 @@ def make_app(config: dict, secrets: dict, refresh_seconds: float = 15) -> web.Ap
             return resp
 
     async def lifecycle(app: web.Application):
-        app["session"] = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=None, sock_connect=20), auto_decompress=False
-        )
+        app["session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=20))
         task = asyncio.create_task(follow_endpoint())
         yield
         task.cancel()

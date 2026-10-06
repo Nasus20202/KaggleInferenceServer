@@ -44,3 +44,21 @@ async def test_server_unreachable(aiohttp_client, monkeypatch, config, unused_tc
     client = await make_client(aiohttp_client, monkeypatch, config, f"http://127.0.0.1:{unused_tcp_port}")
     resp = await client.get("/v1/models")
     assert resp.status == 502
+
+
+async def test_decompresses_gzip_from_the_tunnel(aiohttp_client, aiohttp_server, monkeypatch, config):
+    """Cloudflare gzips responses; the proxy must not pass compressed bytes without Content-Encoding."""
+    from aiohttp import web
+
+    async def models(req: web.Request) -> web.Response:
+        resp = web.json_response({"data": [{"id": "m"}]})
+        resp.enable_compression(web.ContentCoding.gzip)
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/v1/models", models)
+    upstream = await aiohttp_server(app)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.get("/v1/models", headers={"Accept-Encoding": "identity"})
+    assert "Content-Encoding" not in resp.headers
+    assert (await resp.json())["data"][0]["id"] == "m"
