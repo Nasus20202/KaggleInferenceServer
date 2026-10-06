@@ -1,0 +1,20 @@
+# Local OpenAI-compatible endpoint for the Kaggle server: http://127.0.0.1:8080/v1
+#
+#   docker compose up -d                          # proxy
+#   docker compose run --rm kis build             # other kis commands
+#   docker compose run --rm kis up qwen35-4b
+#   docker compose run --rm kis bench --url http://kis:8080
+services:
+  kis:
+    image: ghcr.io/nasus20202/kaggleinferenceserver:latest
+    build: .
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "127.0.0.1:${KIS_PORT:-8080}:8080"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./.kis:/app/.kis
+      - ${HOME}/.kaggle:/home/kis/.kaggle:ro
+    environment:
+      HOME: /home/kis
+    restart: unless-stopped

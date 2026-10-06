@@ -1,0 +1,79 @@
+"""Rendering kernel scripts from config.example.toml, and the model presets."""
+
+import argparse
+import re
+
+import pytest
+
+from kis import cli, kaggle
+
+SECRETS = {"api_key": "secret", "ntfy_topic": "test"}
+
+
+def up_args(**overrides) -> argparse.Namespace:
+    return argparse.Namespace(
+        **{"model": "qwen35-9b", "parallel": None, "topology": None, "no_spec": False, **overrides}
+    )
+
+
+def rendered_config(config: dict, **overrides) -> dict:
+    source = kaggle.render("server.py", cli.server_params(up_args(**overrides), config, SECRETS))
+    compile(source, "server.py", "exec")
+    namespace = {}
+    exec(source[source.index("# <params>") : source.index("# </params>")], namespace)
+    return namespace["CONFIG"]
+
+
+def test_every_preset_renders(config):
+    for name, preset in config["models"].items():
+        rendered = rendered_config(config, model=name)
+        assert rendered["model"] == preset
+        assert rendered["api_key"] == "secret"
+        assert rendered["args"] == config["server"]["args"]
+
+
+def test_rendered_config_has_the_scripts_keys(config, server):
+    assert rendered_config(config).keys() == server.CONFIG.keys()
+
+
+def test_overrides(config):
+    model = rendered_config(config, model="gemma-4-e4b", parallel=3, topology="split", no_spec=True)["model"]
+    assert model["parallel"] == 3
+    assert model["topology"] == "split"
+    assert model["draft_file"] is None
+    assert "--spec-type" not in model["args"] and "--spec-draft-n-max" not in model["args"]
+    assert model["args"][:2] == ["--temp", "1.0"]
+
+
+def test_drop_options():
+    args = ["--spec-type", "draft-mtp", "--temp", "1.0", "--spec-draft-n-max", "2"]
+    assert cli._drop_options(args, "--spec-type", "--spec-draft-n-max") == ["--temp", "1.0"]
+
+
+def test_unknown_model_exits(config):
+    with pytest.raises(SystemExit):
+        cli.server_params(up_args(model="nope"), config, SECRETS)
+
+
+def test_tailscale_needs_authkey(config):
+    config["tunnel"]["kind"] = "tailscale"
+    with pytest.raises(SystemExit):
+        cli.server_params(up_args(), config, SECRETS)
+
+
+def test_build_render_sets_ref():
+    source = kaggle.render("build.py", {"LLAMA_CPP_REF": "b1234"})
+    compile(source, "build.py", "exec")
+    assert "LLAMA_CPP_REF = 'b1234'" in source
+
+
+def test_presets_are_complete(config):
+    for name, preset in config["models"].items():
+        for key in ("repo", "revision", "file", "alias", "parallel"):
+            assert preset.get(key), f"{name}: missing {key}"
+        assert preset.get("topology", "replicas") in ("replicas", "split"), name
+        for key in ("sha256", "draft_sha256"):
+            if key in preset:
+                assert re.fullmatch(r"[0-9a-f]{64}", preset[key]), f"{name}: bad {key}"
+        if "draft_file" in preset:
+            assert "draft_sha256" in preset, f"{name}: unpinned draft"

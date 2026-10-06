@@ -1,0 +1,9 @@
+.git
+.github
+.venv
+.kis
+config.toml
+tests
+**/__pycache__
+.ruff_cache
+.pytest_cache
