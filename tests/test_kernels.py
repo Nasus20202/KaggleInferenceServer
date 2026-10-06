@@ -2,17 +2,20 @@
 
 import argparse
 import re
+import tomllib
+from pathlib import Path
 
 import pytest
 
 from kis import cli, kaggle
 
 SECRETS = {"api_key": "secret", "ntfy_topic": "test"}
+PROFILES = ("config.example.toml", "config.throughput.example.toml")
 
 
 def up_args(**overrides) -> argparse.Namespace:
     return argparse.Namespace(
-        **{"model": "qwen35-9b", "parallel": None, "topology": None, "no_spec": False, **overrides}
+        **{"model": "qwen35-9b", "parallel": None, "topology": None, "ctx": None, "no_spec": False, **overrides}
     )
 
 
@@ -77,3 +80,18 @@ def test_presets_are_complete(config):
                 assert re.fullmatch(r"[0-9a-f]{64}", preset[key]), f"{name}: bad {key}"
         if "draft_file" in preset:
             assert "draft_sha256" in preset, f"{name}: unpinned draft"
+
+
+def test_profiles_differ_only_in_slots_and_context():
+    """config.example.toml (long context) and config.throughput.example.toml (many slots)."""
+    root = Path(__file__).resolve().parent.parent
+    context, throughput = (tomllib.loads((root / f).read_text())["models"] for f in PROFILES)
+    assert context.keys() == throughput.keys()
+    for name in context:
+        c, t = context[name], throughput[name]
+        assert {k: v for k, v in c.items() if k not in ("parallel", "ctx")} == {
+            k: v for k, v in t.items() if k not in ("parallel", "ctx")
+        }, name
+        instances = 1 if c.get("topology") == "split" else 2
+        assert c["parallel"] * instances == 4 and c["ctx"] >= 32768, name
+        assert t["ctx"] == 32768 and t["parallel"] * instances >= 4, name

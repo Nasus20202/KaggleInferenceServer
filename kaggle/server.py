@@ -32,6 +32,7 @@ CONFIG = {
     "idle_minutes": 30,
     "max_hours": 11.5,
     "replica_max_gb": 11.0,
+    "ctx": 32768,
     "args": ["--n-gpu-layers", "999", "--flash-attn", "auto", "--metrics"],
     "model": {
         "repo": "unsloth/Qwen3.5-4B-MTP-GGUF",
@@ -48,6 +49,7 @@ WORK = Path("/kaggle/working")
 MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
 PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
+KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
 STARTED = time.time()
 
 
@@ -105,7 +107,10 @@ def fetch(file: str, sha256: str | None) -> str:
 # --------------------------------------------------------------------------- llama-server instances
 
 
-def launch(binary: str, model_path: str, draft_path: str | None, port: int, gpu_ids: list[str]) -> subprocess.Popen:
+def launch(
+    binary: str, model_path: str, draft_path: str | None, port: int, gpu_ids: list[str], parallel: int, ctx: int
+) -> subprocess.Popen:
+    """One llama-server with `parallel` slots of `ctx` tokens each (KV pool = parallel x ctx)."""
     cmd = [
         binary,
         "-m",
@@ -117,12 +122,14 @@ def launch(binary: str, model_path: str, draft_path: str | None, port: int, gpu_
         "--alias",
         MODEL["alias"],
         "--parallel",
-        str(MODEL["parallel"]),
+        str(parallel),
+        "--kv-unified-per-slot",
+        str(ctx),
     ]
     if draft_path:
         cmd += ["--model-draft", draft_path]
     if len(gpu_ids) > 1:
-        cmd += ["--split-mode", "layer", "--tensor-split", ",".join("1" * len(gpu_ids))]
+        cmd += ["--split-mode", "layer", "--tensor-split", MODEL.get("tensor_split") or ",".join("1" * len(gpu_ids))]
     cmd += CONFIG["args"] + MODEL.get("args", [])
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(gpu_ids)}
     return subprocess.Popen(cmd, env=env, stdout=log_file(f"llama-{port}.log"), stderr=subprocess.STDOUT)
@@ -145,22 +152,53 @@ def plan(gpus: list[str], size_gb: float, topology: str | None, replica_max_gb: 
     return topology, [[g] for g in gpus] if topology == "replicas" else [gpus]
 
 
+OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
+
+
+def gpu_memory() -> dict[str, str]:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader"], text=True
+    )
+    return {i: f"{used} / {total}" for i, used, total in (line.split(", ") for line in out.strip().splitlines())}
+
+
 def start_backends(model_path: str, draft_path: str | None) -> dict[int, subprocess.Popen]:
+    """Start one llama-server per GPU group. The context per slot is fixed; if the KV pool
+    doesn't fit, retry with fewer slots."""
     binary = llama_server_binary()
     gpus = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], text=True).split()
     size_gb = sum(os.path.getsize(p) for p in (model_path, draft_path) if p) / 1e9
     topology, groups = plan(gpus, size_gb, MODEL.get("topology"), CONFIG["replica_max_gb"])
+    parallel, ctx = MODEL["parallel"], MODEL.get("ctx") or CONFIG["ctx"]
 
     ports = range(BACKEND_PORT, BACKEND_PORT + len(groups))
-    backends = {port: launch(binary, model_path, draft_path, port, g) for port, g in zip(ports, groups, strict=True)}
-    for port, proc in backends.items():
-        if not wait_healthy(port, proc):
-            log = (WORK / f"llama-{port}.log").read_text()[-3000:]
-            for other in backends.values():
-                other.terminate()
-            notify("error", error="llama-server failed to start (lower --parallel?)", log=log)
-            raise RuntimeError("llama-server failed to start")
-    notify("backends_ready", topology=topology, gpus=len(gpus), model_gb=round(size_gb, 2), parallel=MODEL["parallel"])
+    while True:
+        backends = {
+            port: launch(binary, model_path, draft_path, port, g, parallel, ctx)
+            for port, g in zip(ports, groups, strict=True)
+        }
+        failed = next((port for port, proc in backends.items() if not wait_healthy(port, proc)), None)
+        if failed is None:
+            break
+        for proc in backends.values():
+            proc.terminate()
+            proc.wait()
+        log = (WORK / f"llama-{failed}.log").read_text()[-3000:]
+        if OOM.search(log) and parallel > 1:
+            parallel -= max(1, parallel // 4)
+            notify("retry", reason="out of memory", parallel=parallel, ctx=ctx)
+            continue
+        notify("error", error="llama-server failed to start (lower --ctx or --parallel?)", log=log)
+        raise RuntimeError("llama-server failed to start")
+    notify(
+        "backends_ready",
+        topology=topology,
+        model_gb=round(size_gb, 2),
+        slots=parallel * len(groups),
+        parallel=parallel,
+        ctx=ctx,
+        gpu_mib=gpu_memory(),
+    )
     return backends
 
 
@@ -192,7 +230,7 @@ class Balancer:
 
     def app(self) -> web.Application:
         async def client_session(app: web.Application):
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None), auto_decompress=False)
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
             yield
             await self.session.close()
 
@@ -227,21 +265,44 @@ class Balancer:
             self.last_activity = time.time()
 
     async def forward(self, req: web.Request, url: str) -> web.StreamResponse:
-        """Proxy one request, streaming the response (SSE included) chunk by chunk."""
+        """Proxy one request, streaming the response (SSE included) chunk by chunk.
+
+        Cloudflare drops requests whose response doesn't start within 100 s (HTTP 524),
+        e.g. a non-streaming completion of a long prompt. If the backend hasn't answered
+        after KEEPALIVE_SECONDS, start a 200 response and send bytes clients ignore
+        (JSON whitespace, SSE comments) until it does.
+        """
         headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
-        async with self.session.request(req.method, url, data=await req.read(), headers=headers) as upstream:
-            resp = web.StreamResponse(
-                status=upstream.status,
-                headers={k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS},
-            )
-            await resp.prepare(req)
-            try:
-                async for chunk in upstream.content.iter_any():
-                    await resp.write(chunk)
-                await resp.write_eof()
-            except ConnectionResetError:  # client went away mid-stream; closing upstream stops generation
-                pass
-            return resp
+        body = await req.read()
+        sse = b'"stream":true' in body.replace(b" ", b"")
+        request = self.session.request(req.method, url, data=body, headers=headers)
+        pending = asyncio.ensure_future(request.__aenter__())
+        resp = None
+        try:
+            while not (await asyncio.wait({pending}, timeout=KEEPALIVE_SECONDS))[0]:
+                if resp is None:
+                    content_type = "text/event-stream" if sse else "application/json"
+                    resp = web.StreamResponse(headers={"Content-Type": content_type})
+                    await resp.prepare(req)
+                await resp.write(b": keepalive\n\n" if sse else b" ")
+            upstream = pending.result()
+            if resp is None:
+                resp = web.StreamResponse(
+                    status=upstream.status,
+                    headers={k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS},
+                )
+                await resp.prepare(req)
+            async for chunk in upstream.content.iter_any():
+                await resp.write(chunk)
+            await resp.write_eof()
+        except ConnectionResetError:  # client went away; closing upstream stops generation
+            pass
+        finally:
+            if pending.done() and not pending.cancelled() and not pending.exception():
+                await request.__aexit__(None, None, None)
+            else:
+                pending.cancel()
+        return resp
 
 
 # --------------------------------------------------------------------------- tunnels

@@ -4,6 +4,7 @@ kis build              compile llama-server for T4 once
 kis up qwen35-9b       start the server kernel and wait for its endpoint
 kis proxy              local endpoint http://127.0.0.1:8080/v1 (any API key)
 kis bench              aggregate tok/s vs concurrency
+kis calibrate          measure context and slot limits of each preset on the T4s
 kis logs | env | down
 """
 
@@ -38,6 +39,8 @@ def server_params(args, config, secrets) -> dict:
         model["parallel"] = args.parallel
     if args.topology:
         model["topology"] = args.topology
+    if args.ctx:
+        model["ctx"] = args.ctx
     if args.no_spec:
         model["draft_file"] = None
         model["args"] = _drop_options(model.get("args", []), "--spec-type", "--spec-draft-n-max")
@@ -53,6 +56,7 @@ def server_params(args, config, secrets) -> dict:
             "idle_minutes": server["idle_minutes"],
             "max_hours": server["max_hours"],
             "replica_max_gb": server["replica_max_gb"],
+            "ctx": server["ctx"],
             "args": server["args"],
             "model": model,
         }
@@ -104,6 +108,53 @@ def follow(config, topic: str, since: str, until_ready: bool = False):
         time.sleep(5)
 
 
+def cmd_calibrate(args, config):
+    names = args.models or list(config["models"])
+    unknown = [n for n in names if n not in config["models"]]
+    if unknown:
+        sys.exit(f"unknown models: {', '.join(unknown)}")
+    topic = load_secrets()["ntfy_topic"] + "-calibrate"  # kept apart from the server's events
+    server = config["server"]
+    since = str(int(time.time()))
+    params = {
+        "RUN": since,
+        "MODELS": {n: config["models"][n] for n in names},
+        "ARGS": _drop_options(server["args"], "--kv-unified-per-slot", "--parallel"),
+        "NTFY_TOPIC": topic,
+        "REPLICA_MAX_GB": server["replica_max_gb"],
+        "CONTEXT_SLOTS": args.slots,
+        "MIN_CTX": args.min_ctx,
+    }
+    kaggle.push(config, kaggle.CALIBRATE, "calibrate.py", params, sources=[kaggle.kernel_id(config, kaggle.BUILD)])
+    print(f"kernel: {kaggle.kernel_url(config, kaggle.CALIBRATE)}")
+    results = {}
+    while True:
+        for msg_id, event in events.fetch(topic, since):
+            since = msg_id
+            if event.get("run") != params["RUN"]:  # an older kernel version still running
+                continue
+            events.show(event)
+            if event["event"] == "calibrated":
+                results[event["model"]] = event
+                save_state(calibration={**load_state().get("calibration", {}), event["model"]: event})
+            if event["event"] in ("calibration_done", "error"):
+                print(calibration_table(results))
+                return
+        time.sleep(10)
+
+
+def calibration_table(results: dict) -> str:
+    lines = [f"{'model':<18} {'topology':<9} {'context: slots x ctx':>22} {'throughput: slots x ctx':>25}"]
+    for name, r in results.items():
+        c, t = r["context"], r["throughput"]
+        slots_c = (c["parallel"] or 0) * r["instances"]
+        slots_t = (t["parallel"] or 0) * r["instances"]
+        lines.append(
+            f"{name:<18} {r['topology']:<9} {slots_c:>10} x {c['ctx'] or '-':>9} {slots_t:>13} x {t['ctx']:>9}"
+        )
+    return "\n".join(lines)
+
+
 def cmd_logs(args, config):
     follow(config, load_secrets()["ntfy_topic"], args.since)
 
@@ -152,8 +203,14 @@ def main():
     p.add_argument("model")
     p.add_argument("--parallel", type=int, help="slots per llama-server instance")
     p.add_argument("--topology", choices=["replicas", "split"])
+    p.add_argument("--ctx", type=int, help="context per slot in tokens")
     p.add_argument("--no-spec", action="store_true", help="disable MTP speculative decoding")
     p.add_argument("--force", action="store_true", help="push even if a server is already up")
+
+    p = sub.add_parser("calibrate", help="measure context and slot limits per model on Kaggle")
+    p.add_argument("models", nargs="*", help="presets to measure (default: all)")
+    p.add_argument("--slots", type=int, default=4, help="total slots for the long-context measurement")
+    p.add_argument("--min-ctx", type=int, default=32768, help="context per slot for the slot measurement")
 
     p = sub.add_parser("logs", help="follow server events")
     p.add_argument("--since", default="1h")

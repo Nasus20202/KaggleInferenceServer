@@ -1,6 +1,7 @@
 """Kaggle-side balancer (kaggle/server.py) against fake llama-server instances."""
 
 import asyncio
+import json
 
 AUTH = {"Authorization": "Bearer secret"}
 
@@ -86,3 +87,19 @@ def test_plan_replicates_small_models_and_splits_large(server):
     assert server.plan(["0", "1"], 17.1, None, 11.0) == ("split", [["0", "1"]])
     assert server.plan(["0", "1"], 5.9, "split", 11.0) == ("split", [["0", "1"]])
     assert server.plan(["0"], 5.9, None, 11.0) == ("replicas", [["0"]])
+
+
+async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server, monkeypatch):
+    """Long prompts: bytes start flowing before Cloudflare's first-byte timeout, and clients still parse them."""
+    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)  # fake backends answer after 0.2 s
+    client = await aiohttp_client(balancer.app())
+
+    resp = await client.post("/v1/chat/completions", json={"max_tokens": 4}, headers=AUTH)
+    raw = await resp.read()
+    assert resp.status == 200 and raw.startswith(b" ")
+    assert json.loads(raw)["usage"]["completion_tokens"] == 4
+
+    resp = await client.post("/v1/chat/completions", json={"stream": True}, headers=AUTH)
+    lines = [line async for line in resp.content if line.strip()]
+    assert lines[0].startswith(b": keepalive") and lines[-1].strip() == b"data: [DONE]"
+    assert all(n == 0 for n in balancer.inflight.values())

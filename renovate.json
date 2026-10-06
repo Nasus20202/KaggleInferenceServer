@@ -23,8 +23,8 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "llama.cpp release tag (config.example.toml, kaggle/build.py)",
-      "managerFilePatterns": ["/^config\\.example\\.toml$/", "/^kaggle/build\\.py$/"],
+      "description": "llama.cpp release tag (example configs, kaggle/build.py)",
+      "managerFilePatterns": ["/^config(\\.throughput)?\\.example\\.toml$/", "/^kaggle/build\\.py$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n[A-Za-z_]+ = \"(?<currentValue>[^\"]+)\""
       ]

@@ -10,6 +10,7 @@ from .settings import ROOT, STATE_DIR
 
 BUILD = "kis-llamacpp-build"
 SERVER = "kis-server"
+CALIBRATE = "kis-calibrate"
 
 
 def kernel_id(config: dict, slug: str) -> str:

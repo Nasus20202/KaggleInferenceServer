@@ -21,7 +21,7 @@ Models that fit one T4 run as **one replica per GPU** behind a least-busy balanc
 2. Install [uv](https://docs.astral.sh/uv/), then:
    ```bash
    uv sync
-   cp config.example.toml config.toml   # set kaggle.username
+   cp config.example.toml config.toml   # set kaggle.username; config.throughput.example.toml for many slots
    ```
 
 **2. Build llama.cpp for T4** (once per llama.cpp version, ~25 min)
@@ -62,27 +62,48 @@ uv run kis down                            # stops the session and saves GPU quo
 
 | Command | What it does |
 | --- | --- |
-| `kis up <model> [--parallel N] [--topology split] [--no-spec]` | start a model (presets in `config.toml`) |
+| `kis up <model> [--parallel N] [--ctx N] [--topology split] [--no-spec]` | start a model (presets in `config.toml`) |
 | `kis proxy [--port P]` | local endpoint; follows the tunnel URL when it changes |
 | `kis bench` | throughput at each concurrency level |
 | `kis logs` | follow server events |
 | `kis env` | print `OPENAI_*` exports for the direct endpoint |
 | `kis down` | stop the server |
 | `kis build [--ref vX.Y.Z]` | compile llama.cpp on Kaggle |
+| `kis calibrate [model...]` | measure on Kaggle how many slots and how much context each preset fits |
 
-If a model runs out of VRAM, `kis up` prints the llama-server log; retry with a lower `--parallel`.
+`parallel` is the number of slots per llama-server instance (2 replicas → 2× the slots) and `ctx` the context each slot is guaranteed. If they don't fit in VRAM, the server starts with fewer slots, never less context, and `backends_ready` shows what it got.
 
 ## Models
 
-`gemma-4-e2b`, `gemma-4-e4b`, `qwen35-4b`, `qwen35-9b` (plus `-q8` variants) run as 2 replicas. `gemma-4-12b` also runs as 2 replicas. `gemma-4-26b-a4b` (MoE, fast) and `qwen38-27b` are split across both GPUs. Each preset pins a revision and sha256 and uses MTP speculative decoding. Add your own presets in `config.toml`.
+Two example configs share the same presets and differ only in slots and context per slot. Both keep the KV cache in f16, so quality isn't reduced. The numbers are measured on Kaggle's T4s with `kis calibrate`.
+
+- `config.example.toml`: **long context.** 4 slots, each with the largest context that fits, capped at the model's trained context.
+- `config.throughput.example.toml`: **many slots.** As many slots as fit at 32K context each.
+
+| preset | layout | long context: slots × ctx | throughput: slots × ctx |
+| --- | --- | --- | --- |
+| `gemma-4-e2b` | 2 replicas | 4 × 128K | 64 × 32K |
+| `gemma-4-e4b` | 2 replicas | 4 × 128K | 42 × 32K |
+| `qwen35-4b` | 2 replicas | 4 × 128K | 18 × 32K |
+| `qwen35-9b` | 2 replicas | 4 × 112K | 14 × 32K |
+| `gemma-4-e4b-q8` | 2 replicas | 4 × 128K | 34 × 32K |
+| `qwen35-4b-q8` | 2 replicas | 4 × 128K | 14 × 32K |
+| `qwen35-9b-q8` | 2 replicas | 4 × 80K | 8 × 32K |
+| `gemma-4-12b` | 2 replicas | 4 × 192K | 14 × 32K |
+| `gemma-4-26b-a4b` | split | 4 × 128K | 14 × 32K |
+| `qwen38-27b` | split | 4 × 40K | 4 × 32K |
+
+Gemma 4 E2B and E4B are trained for 128K, so their long-context limit is the model's own. Each preset pins a revision and sha256 and uses MTP speculative decoding. `kis up <model> --parallel N --ctx N` overrides a preset for one run. After a llama.cpp update or for new presets, rerun `kis calibrate [model...]`.
 
 ## Tunnels
 
 Set `[tunnel] kind` in `config.toml`:
 
-- **`cloudflared`** (default): no account needed, random URL per session. Cloudflare documents no SSE streaming for quick tunnels.
+- **`cloudflared`** (default): no account needed, random URL per session. Streaming (SSE) works in practice, although Cloudflare doesn't document it for quick tunnels.
 - **`cloudflared` + `token` + `public_url`**: a named tunnel with a stable hostname on your Cloudflare domain. Point it to `http://localhost:8080`.
 - **`tailscale` + `authkey`**: private tailnet hostname (use a reusable, ephemeral key).
+
+Cloudflare cuts a request whose response hasn't started within 100 s, such as a long prompt without streaming. If a reply hasn't started after 30 s, the server sends a 200 status and keeps the connection alive with whitespace (JSON) or comments (SSE). An error that comes after that point arrives with status 200.
 
 ## Docker
 
