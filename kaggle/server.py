@@ -10,6 +10,10 @@ while the loaded one keeps serving, then requests in flight finish, new ones wai
 and the instances are replaced. Requests without a known model name go to the loaded
 preset. GET /v1/models lists every preset with its status.
 
+Resident presets (server.resident), such as an embedding model, run on GPU 0 for the
+whole session beside the swapped one: requests naming them go to their instance and
+never swap.
+
 Started by `kis up <model>`, which fills in CONFIG. Status events, the endpoint
 URL and a periodic stats heartbeat go to a private ntfy topic; everything is
 also logged with timestamps to the kernel log and /kaggle/working/server.log
@@ -74,6 +78,7 @@ CONFIG = {
     "models": {},
     "autoload": True,
     "prefetch": [],
+    "resident": [],
     "ntfy": {"server": "https://ntfy.sh", "token": ""},
     "ntfy_topic": "",
     "session": "",
@@ -95,6 +100,7 @@ START = SETTINGS.preset if SETTINGS.preset in PRESETS else next(iter(PRESETS))
 WORK = Path("/kaggle/working")
 PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
+RESIDENT_PORT = 8070  # resident presets use RESIDENT_PORT, RESIDENT_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
 STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
 DRAIN_POLL_S = 0.1  # how often a swap checks whether the requests in flight have finished
@@ -322,6 +328,19 @@ def start_backends(name: str) -> dict[int, subprocess.Popen[bytes]]:
     return backends
 
 
+def start_resident(name: str, port: int) -> subprocess.Popen[bytes]:
+    """One llama-server on GPU 0 for resident preset `name`, kept for the whole session."""
+    model = PRESETS[name]
+    proc = launch(server_binary(), model, model_files(model), port, ["0"], model.parallel, model.ctx or SETTINGS.ctx)
+    if not wait_healthy(port, proc):
+        proc.terminate()
+        proc.wait()
+        tail = (WORK / f"llama-{port}.log").read_text()[-3000:]
+        raise BackendsFailed(f"llama-server failed to start with resident {name}", tail)
+    log.info("resident %s ready on :%d", name, port)
+    return proc
+
+
 class BackendSet(Protocol):
     """What the balancer needs of the backends (Backends, or a stand-in in the tests)."""
 
@@ -333,11 +352,20 @@ class BackendSet(Protocol):
 
 
 class Backends:
-    """The llama-server instances of the loaded preset. Blocking: the balancer calls
-    fetch and load in a thread."""
+    """The llama-server instances of the loaded preset and of the resident presets.
+    Blocking: the balancer calls fetch and load in a thread."""
 
     def __init__(self) -> None:
         self.procs: dict[int, subprocess.Popen[bytes]] = {}
+        self.residents: dict[str, int] = {}  # resident preset -> port
+        self.resident_procs: list[subprocess.Popen[bytes]] = []
+
+    def start_residents(self, names: list[str]) -> None:
+        """Start the resident presets; before the swapped one, so its out-of-memory retries
+        leave room for them."""
+        for port, name in enumerate(names, RESIDENT_PORT):
+            self.resident_procs.append(start_resident(name, port))
+            self.residents[name] = port
 
     @property
     def ports(self) -> list[int]:
@@ -367,7 +395,13 @@ class Backends:
         self.procs = {}
 
     def exited(self) -> bool:
-        return any(proc.poll() is not None for proc in self.procs.values())
+        return any(proc.poll() is not None for proc in [*self.procs.values(), *self.resident_procs])
+
+    def close(self) -> None:
+        self.stop()
+        for proc in self.resident_procs:
+            proc.terminate()
+            proc.wait()
 
 
 # --------------------------------------------------------------------------- balancer
@@ -493,12 +527,20 @@ class Swap:
 
 class Balancer:
     """Checks the API key, swaps to the preset a request names (autoload) and sends each
-    request to the instance of the loaded preset with the fewest in flight."""
+    request to the instance of the loaded preset with the fewest in flight. Requests for
+    a resident preset go to its instance."""
 
     def __init__(
-        self, backends: BackendSet, api_key: str, presets: dict[str, Model] | None = None, loaded: str = ""
+        self,
+        backends: BackendSet,
+        api_key: str,
+        presets: dict[str, Model] | None = None,
+        loaded: str = "",
+        residents: dict[str, int] | None = None,
     ) -> None:
         self.backends = backends
+        self.residents = residents or {}  # resident preset -> port
+        self.resident_inflight = 0
         self.presets = presets or PRESETS
         self.loaded = loaded or START  # preset name
         self.inflight = {port: 0 for port in backends.ports}
@@ -516,7 +558,7 @@ class Balancer:
 
     @property
     def idle_seconds(self) -> float:
-        busy = self.swap or self.waiting or any(self.inflight.values())
+        busy = self.swap or self.waiting or self.resident_inflight or any(self.inflight.values())
         return 0 if busy else time.time() - self.last_activity
 
     @property
@@ -576,10 +618,15 @@ class Balancer:
         self.requests += 1
         self.last_activity = start = time.time()
         port, status, detail = 0, 0, ""
+        name: str | None = None
 
         async def connect() -> aiohttp.ClientResponse:
             nonlocal port, admitted
-            port = await self.admit(name)
+            if name in self.residents:
+                port = self.residents[name]
+                self.resident_inflight += 1
+            else:
+                port = await self.admit(name)
             self.waiting -= 1  # now in flight
             admitted = True
             headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
@@ -609,7 +656,9 @@ class Balancer:
             log.exception("%s %s -> :%d failed", req.method, req.path, port)
             raise
         finally:
-            if admitted:
+            if admitted and name in self.residents:
+                self.resident_inflight -= 1
+            elif admitted:
                 self.inflight[port] -= 1
             else:
                 self.waiting -= 1
@@ -643,7 +692,13 @@ class Balancer:
                 doc = json.loads(body)
                 name = doc.get("model") if isinstance(doc, dict) else None
         preset = self.resolve(name)
-        if preset and not SETTINGS.autoload and preset not in (self.loaded, self.swap and self.swap.target):
+        swappable = preset not in self.residents
+        if (
+            preset
+            and swappable
+            and not SETTINGS.autoload
+            and preset not in (self.loaded, self.swap and self.swap.target)
+        ):
             loaded = self.presets[self.loaded].alias
             raise SwapFailed(f"model {name} is not loaded ({loaded} is) and autoload is off: `kis use {preset}`")
         return preset
@@ -726,7 +781,7 @@ class Balancer:
             )
         self.last_activity = time.time()
         answer = {"preset": name, "model": self.presets[name].alias, "session": SETTINGS.session}
-        if name == self.loaded and not self.swap:
+        if name in self.residents or (name == self.loaded and not self.swap):
             return web.json_response({**answer, "status": ModelStatus.LOADED.value})
 
         async def load() -> None:
@@ -739,6 +794,8 @@ class Balancer:
         return web.json_response({**answer, "status": ModelStatus.LOADING.value}, status=202)
 
     def status(self, name: str) -> ModelStatus:
+        if name in self.residents:
+            return ModelStatus.LOADED
         if self.swap and self.swap.target == name:
             return ModelStatus.LOADING
         if name == self.loaded and not self.loading:
@@ -757,6 +814,8 @@ class Balancer:
                 "topology": RUNTIME.topology,
             }
         model = self.presets[name]
+        if name in self.residents:
+            return {"context_length": model.ctx or SETTINGS.ctx, "parallel": model.parallel, "slots": model.parallel}
         return {
             "context_length": model.ctx or SETTINGS.ctx,
             "parallel": FITTED.get(name, model.parallel),
@@ -775,6 +834,7 @@ class Balancer:
                 "owned_by": "kis",
                 "preset": name,
                 "status": self.status(name).value,
+                "resident": name in self.residents,
                 **self.layout(name),
             }
             for name, model in self.presets.items()
@@ -799,6 +859,7 @@ class Balancer:
             errors=self.errors,
             usage={model: u.summary() for model, u in self.usage.items()},
             gpus=await asyncio.to_thread(gpu_stats),
+            resident=[self.presets[name].alias for name in self.residents],
         )
 
     def logs(self, req: web.Request) -> web.Response:
@@ -941,7 +1002,7 @@ TUNNELS = {TunnelKind.CLOUDFLARED: cloudflared, TunnelKind.TAILSCALE: tailscale}
 
 async def serve(backends: Backends) -> str:
     """Run the balancer and tunnel until shutdown; return the stop reason."""
-    balancer = Balancer(backends, SETTINGS.api_key)
+    balancer = Balancer(backends, SETTINGS.api_key, residents=backends.residents)
     await balancer.start()
     tunnel = SETTINGS.tunnel
 
@@ -978,14 +1039,16 @@ def main() -> None:
     backends.fetch(START)
     notify(EventType.DOWNLOADED)
     try:
+        backends.start_residents(SETTINGS.resident)
         backends.load(START)
     except BackendsFailed as e:
         notify(EventType.ERROR, error=str(e), log=e.log)
+        backends.close()
         sys.exit(1)
     try:
         reason = asyncio.run(serve(backends))
     finally:
-        backends.stop()
+        backends.close()
     notify(EventType.STOPPED, reason=reason)
 
 

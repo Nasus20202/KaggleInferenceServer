@@ -163,3 +163,13 @@ def test_prefetch_names_presets(config):
     config.server = dataclasses.replace(config.server, prefetch=["nope"])
     with pytest.raises(SystemExit, match=r"server\.prefetch"):
         cli.server_config(up_args(), config, SECRETS)
+
+
+def test_resident_presets_are_checked_and_passed_to_the_server(config):
+    config.server.resident = ["qwen35-4b"]
+    assert rendered_config(config)["resident"] == ["qwen35-4b"]
+    with pytest.raises(SystemExit):
+        cli.server_config(up_args(model="qwen35-4b"), config, SECRETS)
+    config.server.resident = ["nope"]
+    with pytest.raises(SystemExit):
+        cli.server_config(up_args(), config, SECRETS)

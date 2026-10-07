@@ -60,8 +60,11 @@ def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) ->
     line's overrides, and can swap to every other preset of config.toml."""
     if args.model not in config.models:
         sys.exit(f"unknown model {args.model!r}; choose from: {', '.join(config.models)}")
-    if unknown := [n for n in config.server.prefetch if n not in config.models]:
-        sys.exit(f"server.prefetch: unknown models {', '.join(unknown)}")
+    for key in ("prefetch", "resident"):
+        if unknown := [n for n in getattr(config.server, key) if n not in config.models]:
+            sys.exit(f"server.{key}: unknown models {', '.join(unknown)}")
+    if args.model in config.server.resident:
+        sys.exit(f"{args.model} is resident: start a preset that can be swapped")
     model = config.models[args.model]
     if args.parallel:
         model = dataclasses.replace(model, parallel=args.parallel)
@@ -80,7 +83,8 @@ def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) ->
         preset=args.model,
         models={**config.models, args.model: model},
         autoload=server.autoload,
-        prefetch=[n for n in server.prefetch if n != args.model],
+        prefetch=[n for n in server.prefetch if n != args.model and n not in server.resident],
+        resident=server.resident,
         ntfy=config.ntfy,
         ntfy_topic=secrets.ntfy_topic,
         notify=config.notify,

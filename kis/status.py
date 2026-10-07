@@ -62,7 +62,8 @@ def format_models(models: list[dict[str, Any]]) -> str:
         if ctx := m.get("context_length"):
             slots = f"{m['slots']} slots" if m.get("slots") else f"{m.get('parallel')} per instance"
             layout = f"  {slots} x {ctx // 1024}K"
-        lines.append(f"{mark} {m['preset']:<{width}}  {m['id']}  {m.get('status', '')}{layout}".rstrip())
+        status = "resident" if m.get("resident") else m.get("status", "")
+        lines.append(f"{mark} {m['preset']:<{width}}  {m['id']}  {status}{layout}".rstrip())
     return "\n".join(lines)
 
 
@@ -76,6 +77,8 @@ def format_stats(s: Stats) -> str:
         f"requests: {s.requests} ({s.errors} errors), {s.inflight} in flight, "
         f"up {s.uptime_s // 60} min, idle {s.idle_s // 60} min",
     ]
+    if s.resident:
+        lines.insert(1, f"resident: {', '.join(s.resident)}")
     for model, u in s.usage.items():
         lines.append(
             f"{model}: {u.requests} completions, tokens in {u.tokens_in} "

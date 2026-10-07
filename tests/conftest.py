@@ -68,6 +68,7 @@ def fake_llama_server(name: str, delay: float = 0.0) -> web.Application:
         return web.json_response({"backend": name})
 
     app.router.add_post("/v1/chat/completions", chat)
+    app.router.add_post("/v1/embeddings", chat)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/props", props)
     return app

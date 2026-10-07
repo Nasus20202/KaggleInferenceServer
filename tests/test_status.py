@@ -49,10 +49,12 @@ def test_format_models_marks_the_loaded_preset():
     models = [
         {"id": "Qwen3.5-4B-Q4_K_M", "preset": "qwen35-4b", "status": "downloaded"},
         {"id": "gemma-4-12B-it-qat-UD-Q4_K_XL", "preset": "gemma-4-12b", "status": "loaded"},
+        {"id": "embeddinggemma", "preset": "embed", "status": "loaded", "resident": True},
     ]
     assert status.format_models(models).splitlines() == [
         "  qwen35-4b    Qwen3.5-4B-Q4_K_M  downloaded",
         "* gemma-4-12b  gemma-4-12B-it-qat-UD-Q4_K_XL  loaded",
+        "* embed        embeddinggemma  resident",
     ]
 
 

@@ -187,3 +187,34 @@ async def test_models_report_context_and_slots(swapper, server, monkeypatch):
     models = (await (await client.get("/v1/models", headers=AUTH)).json())["data"]
     layout = [(m["context_length"], m["parallel"], m["slots"], m["topology"]) for m in models]
     assert layout == [(65536, 4, 8, "replicas"), (32768, 1, None, None)]  # a as running, b as configured
+
+
+@pytest.fixture
+async def with_resident(server, aiohttp_server, aiohttp_client):
+    """A balancer with preset a loaded and resident preset e; returns (balancer, backends, client, e's server)."""
+    embedder = await aiohttp_server(fake_llama_server("e0"))
+    presets = {**PRESETS, "e": Model(repo="r", file="e.gguf", alias="E-Q8", parallel=4, ctx=2048)}
+    backends = FakeBackends({"a": [(await aiohttp_server(fake_llama_server("a0"))).port], "b": []}, "a")
+    balancer = server.Balancer(backends, "secret", presets=presets, loaded="a", residents={"e": embedder.port})
+    return balancer, backends, await aiohttp_client(balancer.app()), embedder
+
+
+async def test_requests_for_a_resident_preset_go_to_it_and_never_swap(with_resident):
+    balancer, backends, client, embedder = with_resident
+    for name in ("e", "E-Q8"):
+        resp = await client.post("/v1/embeddings", json={"model": name}, headers=AUTH)
+        assert (await resp.json())["backend"] == "e0"
+    assert (await chat(client, "A-Q4"))[1]["backend"] == "a0"
+    assert len(embedder.app["received"]) == 2
+    assert backends.loads == []
+    assert balancer.resident_inflight == 0
+
+
+async def test_resident_presets_are_listed_as_loaded(with_resident):
+    _, backends, client, _ = with_resident
+    models = {m["preset"]: m for m in (await (await client.get("/v1/models", headers=AUTH)).json())["data"]}
+    assert (models["e"]["status"], models["e"]["resident"], models["e"]["slots"]) == ("loaded", True, 4)
+    assert models["a"]["resident"] is False
+    resp = await client.post("/admin/load?model=e", headers=AUTH)
+    assert (await resp.json())["status"] == "loaded"
+    assert backends.loads == []

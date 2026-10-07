@@ -33,6 +33,7 @@ class Server:
     ctx: int = 32768
     autoload: bool = True
     prefetch: list[str] = field(default_factory=list)
+    resident: list[str] = field(default_factory=list)
     args: list[str] = field(default_factory=list)
 
 

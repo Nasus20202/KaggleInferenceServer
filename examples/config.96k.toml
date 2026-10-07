@@ -60,6 +60,9 @@ autoload = true
 # Presets to download in the background once the server is ready, so swapping to them
 # only loads them (each takes disk space on the kernel for the session).
 prefetch = []
+# Presets served on GPU 0 for the whole session beside the swapped one and never
+# swapped out, e.g. an embedding model for RAG.
+resident = []
 # Arguments for every model; per-model `args` are appended.
 args = [
   "--n-gpu-layers", "999",

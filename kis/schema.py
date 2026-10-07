@@ -177,6 +177,7 @@ class ServerConfig:
     models: dict[str, Model] = field(default_factory=dict)  # presets the session can swap to, `model` included
     autoload: bool = True  # a request naming another preset swaps to it
     prefetch: list[str] = field(default_factory=list)  # presets downloaded in the background after startup
+    resident: list[str] = field(default_factory=list)  # presets served on GPU 0 for the whole session, never swapped
     ntfy: Ntfy = field(default_factory=Ntfy)
     ntfy_topic: str = ""  # private control topic: events and the endpoint
     session: str = ""  # id in every event; `kis` tells sessions apart during a rollover
@@ -332,6 +333,7 @@ class Stats:
     usage: dict[str, UsageSummary]  # per model name
     gpus: list[GpuStats]
     preset: str = ""  # name of the loaded preset
+    resident: list[str] = field(default_factory=list)  # aliases of the resident presets
 
 
 # --------------------------------------------------------------------------- calibration

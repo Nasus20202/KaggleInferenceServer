@@ -82,7 +82,7 @@ uv run kis down                            # stops the session and saves GPU quo
 
 ## Switching models
 
-A session holds one model at a time and can swap to any preset in `config.toml`. `kis up <model>` picks the one it starts with. To switch, name another preset in a request's `model`, by preset name or alias:
+A session holds one model at a time, besides any resident presets, and can swap to any preset in `config.toml`. `kis up <model>` picks the one it starts with. To switch, name another preset in a request's `model`, by preset name or alias:
 
 ```bash
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -111,10 +111,11 @@ Waiting requests get keepalive bytes, so a swap longer than Cloudflare's 100 s l
   - `parallel` (slots per instance), `slots` (in total) and `topology`. The loaded preset shows what it runs with after any out-of-memory retries. The others show their configured values, with `slots` (and `topology`, unless the preset sets it) `null` until they run.
 - **`autoload = false`** in `[server]`: only `kis use` swaps; a request for another preset gets a 400 `model_not_loaded`.
 - **`prefetch = ["gemma-4-12b"]`** in `[server]`: download those presets in the background after startup, so swapping to them only loads them.
+- **`resident = ["embeddinggemma"]`** in `[server]`: run those presets on GPU 0 for the whole session, beside the swapped one, e.g. an embedding model next to the chat model for RAG. Requests that name them go to their instance and never swap; `/v1/models` lists them as `loaded` with `"resident": true`, and `kis use` as `resident`. They start first, so the swapped preset's out-of-memory retries leave room for them. `kis up` starts a preset that isn't resident. An embedding preset needs `--embeddings` in its `args`.
 - **Overrides:** `--parallel`, `--ctx`, `--topology` and `--no-spec` apply to the preset `kis up` starts with; the others keep their calibrated values. Each preset remembers the slots that fit after an out-of-memory retry, so loading it again is quicker.
 - **Rollover** starts the new session with the preset loaded at that point.
 
-Clients that alternate between presets make the session swap back and forth, and each swap costs a model load. Keep such clients on one preset, or set `autoload = false`. Downloaded files stay on the kernel's disk until the session ends.
+Clients that alternate between presets make the session swap back and forth, and each swap costs a model load. Keep such clients on one preset, make the other one resident, or set `autoload = false`. Downloaded files stay on the kernel's disk until the session ends.
 
 ## Monitoring and logs
 
