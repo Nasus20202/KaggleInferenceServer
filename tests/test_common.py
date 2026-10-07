@@ -13,7 +13,7 @@ def test_replica_command():
     cmd, env = common.llama_command("llama-server", MODEL, ("m.gguf", None), 8090, ["1"], 4, 65536, ["--metrics"])
     assert cmd == [
         "llama-server", "-m", "m.gguf", "--host", "127.0.0.1", "--port", "8090", "--alias", "m",
-        "--parallel", "4", "--kv-unified-per-slot", "65536", "--metrics", "--temp", "1.0",
+        "--no-webui", "--parallel", "4", "--kv-unified-per-slot", "65536", "--metrics", "--temp", "1.0",
     ]  # fmt: skip
     assert env["CUDA_VISIBLE_DEVICES"] == "1"
 
