@@ -6,7 +6,7 @@ Run llama.cpp on Kaggle's free GPUs (2× T4, 30 h/week) and use it locally as an
 your app ─> kis proxy (127.0.0.1:8080) ─> tunnel ─> Kaggle: balancer ─> llama-server per GPU
 ```
 
-Models that fit one T4 run as **one replica per GPU** behind a least-busy balancer, which gives about 2× throughput. Bigger models are split across both GPUs. The Kaggle session stops itself after 30 idle minutes.
+Models that fit one T4 run as **one replica per GPU** behind a least-busy balancer, which gives about 2× throughput. Bigger models are split across both GPUs. The Kaggle session stops itself after 10 idle minutes; starting again takes about 1 minute for small models and about 4 for the 27B.
 
 ## Quick start
 
@@ -36,7 +36,7 @@ uv run kis build
 uv run kis up qwen35-4b
 ```
 
-It prints progress (`downloaded` → `backends_ready` → `ready: https://….trycloudflare.com/v1`) and returns when the endpoint is ready, usually in 2–5 min.
+It prints progress (`downloaded` → `backends_ready` → `ready: https://….trycloudflare.com/v1`) and returns when the endpoint is ready. Measured from `kis up`: 50 s for `qwen35-4b` and 4 min for `qwen38-27b` (mostly the 18 GB download).
 
 **4. Use it**
 
@@ -93,6 +93,16 @@ GPU1: 13.6 / 15.0 GiB VRAM, 64% busy
 ```
 
 `kis up` also prints the quota before it starts a session. `kis status` also shows the token totals per model (see below).
+
+### Phone notifications
+
+Set `[notify] topic` in `config.toml` and subscribe to that topic in the [ntfy](https://ntfy.sh) app. You get:
+- **Ready:** the model, slots and startup time.
+- **Stopped:** the reason and how long the session ran.
+- **Failed:** the error.
+- **Out of memory:** each retry with fewer slots.
+
+These messages never contain the endpoint or keys, so a guessable topic name is fine for them. `kis` uses its own private, random topic (in `.kis/secrets.json`) to find the server; never point that one at a public name, because anyone who can post to it could redirect `kis` to their own URL and receive your API key. `[notify] token` (or `KIS_NOTIFY_TOKEN`) is for access-protected topics.
 
 ### Stats API
 
@@ -154,7 +164,7 @@ Measured with `kis calibrate` on Kaggle's 2× T4 (llama.cpp v0.6.0). Each cell s
 <!-- calibration -->
 | model | 32k | 64k | 96k | 128k | max |
 | --- | --- | --- | --- | --- | --- |
-| `gemma-4-e2b` | 64 x 32K<br>94.2 / 684.6 tok/s | 64 x 64K<br>104.3 / 706.6 tok/s | 44 x 96K<br>103.5 / 627.8 tok/s | 32 x 128K<br>110.0 / 608.6 tok/s | 32 x 128K<br>99.0 / 680.6 tok/s |
+| `gemma-4-e2b` | 64 x 32K<br>97.9 / 696.2 tok/s | 64 x 64K<br>109.5 / 670.0 tok/s | 44 x 96K<br>109.0 / 690.8 tok/s | 32 x 128K<br>105.4 / 662.2 tok/s | 32 x 128K<br>102.7 / 674.4 tok/s |
 | `gemma-4-e4b` | 42 x 32K<br>65.8 / 587.8 tok/s | 22 x 64K<br>68.3 / 498.0 tok/s | 14 x 96K<br>62.3 / 429.6 tok/s | 10 x 128K<br>77.4 / 386.6 tok/s | 10 x 128K<br>67.0 / 380.8 tok/s |
 | `qwen35-4b` | 18 x 32K<br>44.1 / 203.8 tok/s | 8 x 64K<br>49.6 / 184.2 tok/s | 6 x 96K<br>43.1 / 163.4 tok/s | 4 x 128K<br>47.5 / 124.4 tok/s | 2 x 256K<br>42.4 / 89.4 tok/s |
 | `qwen35-9b` | 14 x 32K<br>22.6 / 153.4 tok/s | 6 x 64K<br>29.8 / 125.8 tok/s | 4 x 96K<br>27.2 / 71.4 tok/s | 2 x 128K<br>30.2 / 56.0 tok/s | 1 x 256K split<br>34.7 / 37.1 tok/s |

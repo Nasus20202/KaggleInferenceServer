@@ -61,6 +61,10 @@ def server_params(args, config, secrets) -> dict:
             "idle_minutes": server["idle_minutes"],
             "max_hours": server["max_hours"],
             "session": "",
+            "notify": {
+                "topic": config.get("notify", {}).get("topic", ""),
+                "token": os.environ.get("KIS_NOTIFY_TOKEN") or config.get("notify", {}).get("token", ""),
+            },
             "replica_max_gb": server["replica_max_gb"],
             "ctx": server["ctx"],
             "max_queue": server.get("max_queue"),

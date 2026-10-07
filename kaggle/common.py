@@ -17,11 +17,13 @@ from pathlib import Path
 MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
 
 
-def publish(topic: str, payload: dict) -> str:
-    """Send one JSON event to an ntfy.sh topic (if set); return it. Raises OSError on failure."""
-    msg = json.dumps(payload)
+def publish(topic: str, payload: dict | str, headers: dict | None = None) -> str:
+    """Send one message (a JSON event, or text with ntfy headers like Title) to an ntfy.sh
+    topic, if set; return it. Raises OSError on failure."""
+    msg = payload if isinstance(payload, str) else json.dumps(payload)
     if topic:
-        urllib.request.urlopen(f"https://ntfy.sh/{topic}", data=msg.encode(), timeout=10)
+        req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(), headers=headers or {})
+        urllib.request.urlopen(req, timeout=10)
     return msg
 
 

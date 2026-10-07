@@ -35,8 +35,9 @@ CONFIG = {
     "api_key": "change-me",
     "ntfy_topic": "",
     "session": "",  # id in every event; `kis` tells sessions apart during a rollover
+    "notify": {"topic": "", "token": ""},  # optional human-readable notifications (phone)
     "tunnel": {"kind": "cloudflared"},
-    "idle_minutes": 30,
+    "idle_minutes": 10,
     "max_hours": 11.5,
     "replica_max_gb": 11.0,
     "ctx": 32768,
@@ -79,6 +80,37 @@ def notify(event: str, **data):
         publish(CONFIG["ntfy_topic"], payload)
     except OSError as e:
         log.warning("ntfy failed: %s", e)
+    if (note := notification(event, data)) and CONFIG.get("notify", {}).get("topic"):
+        title, message, priority, tags = note
+        headers = {"Title": title, "Priority": priority, "Tags": tags}
+        if token := CONFIG["notify"].get("token"):
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            publish(CONFIG["notify"]["topic"], message, headers)
+        except OSError as e:
+            log.warning("notification failed: %s", e)
+
+
+def notification(event: str, data: dict) -> tuple[str, str, str, str] | None:
+    """(title, message, priority, tags) for the events worth a phone notification.
+    Never includes the endpoint or keys: the notification topic may be public."""
+    model = MODEL["alias"]
+    if event == "ready":
+        layout = f"{RUNTIME.get('slots', '?')} slots x {RUNTIME.get('ctx', '?')} tokens"
+        message = f"{layout}, ready after {round(time.time() - STARTED)} s"
+        return f"{model} ready", message, "default", "white_check_mark"
+    if event == "stopped":
+        return (
+            f"{model} stopped",
+            f"{data.get('reason')} after {round((time.time() - STARTED) / 60)} min",
+            "default",
+            "stop_sign",
+        )
+    if event == "error":
+        return f"{model} failed", str(data.get("error"))[:300], "high", "warning"
+    if event == "retry":
+        return f"{model}: out of memory", f"retrying with {data.get('parallel')} slots", "low", "hourglass"
+    return None
 
 
 def log_file(name: str):

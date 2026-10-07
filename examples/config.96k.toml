@@ -23,9 +23,16 @@ public_url = ""   # e.g. "https://llm.example.com" (named tunnel)
 authkey = ""      # tailscale auth key
 hostname = "kaggle-llm"
 
+[notify]
+# Optional phone/desktop notifications (ntfy.sh app): model ready, stopped, failed, out-of-memory
+# retries. Never the endpoint or keys. kis' own control topic stays private and random.
+# A token (or KIS_NOTIFY_TOKEN) is for access-protected topics.
+topic = ""
+token = ""
+
 [server]
 # The kernel exits on its own (saving GPU quota) after this much inactivity / total time.
-idle_minutes = 30
+idle_minutes = 10  # restarting takes ~1 min (small models) to ~4 min (27B)
 max_hours = 11.5   # Kaggle ends a session after 12 h; also capped at 2 min before the GPU quota runs out
 # `kis proxy` replaces a session this old with a fresh one, without downtime (0 = off).
 rollover_hours = 11.0
