@@ -62,3 +62,44 @@ async def test_decompresses_gzip_from_the_tunnel(aiohttp_client, aiohttp_server,
     resp = await client.get("/v1/models", headers={"Accept-Encoding": "identity"})
     assert "Content-Encoding" not in resp.headers
     assert (await resp.json())["data"][0]["id"] == "m"
+
+
+async def test_logs_each_request(aiohttp_client, monkeypatch, config, balancer_url, caplog):
+    client = await make_client(aiohttp_client, monkeypatch, config, balancer_url)
+    with caplog.at_level("INFO", logger="kis.proxy"):
+        await client.get("/v1/models")
+    assert any(r.getMessage().startswith("GET /v1/models 200 ") for r in caplog.records)
+
+
+async def test_retries_transient_upstream_errors(aiohttp_client, aiohttp_server, monkeypatch, config):
+    from aiohttp import web
+
+    calls = []
+
+    async def models(req: web.Request) -> web.Response:
+        calls.append(1)
+        if len(calls) < 3:
+            return web.Response(status=502, text="tunnel reconnecting")
+        return web.json_response({"data": [{"id": "m"}]})
+
+    app = web.Application()
+    app.router.add_get("/v1/models", models)
+    upstream = await aiohttp_server(app)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.get("/v1/models")
+    assert resp.status == 200 and len(calls) == 3
+
+
+async def test_does_not_retry_client_errors(aiohttp_client, monkeypatch, config, balancer_url):
+    monkeypatch.setitem(SECRETS, "api_key", "wrong")
+    client = await make_client(aiohttp_client, monkeypatch, config, balancer_url)
+    assert (await client.get("/v1/models")).status == 401
+
+
+async def test_optional_local_api_key(aiohttp_client, monkeypatch, config, balancer_url):
+    monkeypatch.setenv("KIS_PROXY_API_KEY", "local-secret")
+    client = await make_client(aiohttp_client, monkeypatch, config, balancer_url)
+    assert (await client.get("/v1/models")).status == 401
+    assert (await client.get("/v1/models", headers={"Authorization": "Bearer nope"})).status == 401
+    assert (await client.get("/v1/models", headers={"Authorization": "Bearer local-secret"})).status == 200
+    assert (await client.get("/v1/models", headers={"x-api-key": "local-secret"})).status == 200

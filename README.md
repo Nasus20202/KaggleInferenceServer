@@ -21,7 +21,7 @@ Models that fit one T4 run as **one replica per GPU** behind a least-busy balanc
 2. Install [uv](https://docs.astral.sh/uv/), then:
    ```bash
    uv sync
-   cp config.example.toml config.toml   # set kaggle.username; config.throughput.example.toml for many slots
+   cp examples/config.32k.toml config.toml   # set kaggle.username; see Models for the other profiles
    ```
 
 **2. Build llama.cpp for T4** (once per llama.cpp version, ~25 min)
@@ -51,6 +51,10 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Any OpenAI client works with `base_url="http://127.0.0.1:8080/v1"`.
 
+By default, any client on your machine can use the proxy. Set `KIS_PROXY_API_KEY` to require a key: clients then send `Authorization: Bearer <key>` (or `x-api-key`), and other requests get 401. Do this when the proxy listens beyond localhost, as in Docker. The Kaggle server always has its own generated key; the proxy adds it.
+
+The proxy retries transient failures with exponential backoff and jitter: a dropped connection, or a 502/503/504/524 while the tunnel reconnects. It re-reads the endpoint between retries and only retries before any bytes have reached the client. `kis` commands retry Kaggle, ntfy and server calls the same way.
+
 **5. Measure and stop**
 
 ```bash
@@ -64,36 +68,107 @@ uv run kis down                            # stops the session and saves GPU quo
 | --- | --- |
 | `kis up <model> [--parallel N] [--ctx N] [--topology split] [--no-spec]` | start a model (presets in `config.toml`) |
 | `kis proxy [--port P]` | local endpoint; follows the tunnel URL when it changes |
+| `kis status` | GPU quota left and reset time, kernel states, VRAM and load of the running server |
 | `kis bench` | throughput at each concurrency level |
-| `kis logs` | follow server events |
+| `kis logs [--file llama-8090.log]` | follow server events, or print a log file from the running server |
 | `kis env` | print `OPENAI_*` exports for the direct endpoint |
 | `kis down` | stop the server |
+| `kis rollover` | replace the running session with a fresh one, without downtime |
 | `kis build [--ref vX.Y.Z]` | compile llama.cpp on Kaggle |
-| `kis calibrate [model...]` | measure on Kaggle how many slots and how much context each preset fits |
+| `kis calibrate [--write] [model...]` | measure slots, context and speed of each preset on Kaggle |
 
 `parallel` is the number of slots per llama-server instance (2 replicas → 2× the slots) and `ctx` the context each slot is guaranteed. If they don't fit in VRAM, the server starts with fewer slots, never less context, and `backends_ready` shows what it got.
 
+## Monitoring and logs
+
+```
+$ kis status
+GPU quota: 28.3 h left of 30 h (1.7 h used), resets Sat 10 Oct 02:00 (in 2d 18h)
+kis-server: running
+endpoint: https://….trycloudflare.com/v1
+model: Qwen3.5-9B-Q4_K_M  replicas, 4 slots x 114688 tokens
+requests: 12 (0 errors), 1 in flight, up 25 min, idle 0 min
+GPU0: 13.6 / 15.0 GiB VRAM, 87% busy
+GPU1: 13.6 / 15.0 GiB VRAM, 64% busy
+```
+
+`kis up` also prints the quota before it starts a session. `kis status` also shows the token totals per model (see below).
+
+### Stats API
+
+`GET /admin/stats` on the Kaggle server returns the same data as JSON. It needs the server's API key (`kis env` prints it). Through `kis proxy`, `curl localhost:8080/admin/stats` works without it (with `KIS_PROXY_API_KEY` if you set one):
+
+```json
+{
+  "model": "Qwen3.5-4B-Q4_K_M", "topology": "replicas", "slots": 4, "parallel": 2, "ctx": 131072,
+  "uptime_s": 1500, "idle_s": 3, "inflight": 1, "requests": 12, "errors": 0,
+  "usage": {"Qwen3.5-4B-Q4_K_M": {
+    "requests": 11, "tokens_in": 52310, "tokens_out": 8120, "tokens_cached": 41870, "cache_rate": 0.8,
+    "prefill_tps": 1450.2, "decode_tps": 68.4, "draft_acceptance": 0.71}},
+  "gpus": [{"gpu": 0, "used_mib": 12711, "total_mib": 15360, "util_pct": 87}, {"gpu": 1, "...": "..."}]
+}
+```
+
+In `usage`:
+- **Tokens:** `tokens_in` counts every prompt token, and `tokens_cached` the ones served from llama.cpp's prompt cache; `cache_rate` = cached / in.
+- **Speeds:** `prefill_tps` and `decode_tps` are per-request speeds, weighted by time.
+- **Draft acceptance:** the share of MTP draft tokens accepted.
+
+`GET /admin/logs?file=server.log&lines=200` returns a log file (`kis logs --file`).
+
+The places to look:
+- **Events:** start, ready, errors, and a stats heartbeat every 10 min. `kis logs` follows them.
+- **Server log:** timestamped, one line per request: backend, status, duration, tokens in/cached/out, prefill and decode speed, draft acceptance. `kis logs --file server.log` prints it; it's also in the Kaggle kernel log.
+- **llama-server output:** `kis logs --file llama-8090.log` (`llama-8091.log` for the second replica).
+- **Local:** `kis proxy` logs each request and endpoint changes. `-v` or `KIS_LOG_LEVEL=DEBUG` adds more detail.
+
+## Long runs, quota and overload
+
+A Kaggle session lasts at most 12 hours. While `kis proxy` runs, it replaces a session after `rollover_hours` (11 by default):
+1. **Start:** it launches a replacement on a second kernel (`kis-server-b`, alternating with `kis-server`) while the old session keeps serving.
+2. **Switch:** once the replacement is ready, new requests go to it.
+3. **Drain:** the old session finishes its in-flight requests and is shut down.
+
+Clients see no errors, but the new session starts with an empty prompt cache. For about 5 minutes both sessions run, which costs double GPU quota. `kis rollover` does the same by hand. Each session has an id in its events, so `kis` can tell the two sessions apart while both run.
+
+Sessions also stop 2 minutes before the weekly GPU quota runs out, with a clean `stopped` event. A rollover isn't started with less than 15 minutes of quota left.
+
+`max_queue` (unset by default) caps the requests waiting beyond the slots. When the cap is reached, the server answers 429 with `Retry-After: 5`, and `kis proxy` retries with backoff.
+
 ## Models
 
-Two example configs share the same presets and differ only in slots and context per slot. Both keep the KV cache in f16, so quality isn't reduced. The numbers are measured on Kaggle's T4s with `kis calibrate`.
+`examples/` has one config per context profile. Every profile holds the same presets and fills each slot's context first, then adds as many slots as fit:
 
-- `config.example.toml`: **long context.** 4 slots, each with the largest context that fits, capped at the model's trained context.
-- `config.throughput.example.toml`: **many slots.** As many slots as fit at 32K context each.
+| file | context per slot |
+| --- | --- |
+| `config.32k.toml` | 32K |
+| `config.64k.toml` | 64K |
+| `config.96k.toml` | 96K |
+| `config.128k.toml` | 128K |
+| `config.max.toml` | the largest that fits, up to the model's trained context |
 
-| preset | layout | long context: slots × ctx | throughput: slots × ctx |
-| --- | --- | --- | --- |
-| `gemma-4-e2b` | 2 replicas | 4 × 128K | 64 × 32K |
-| `gemma-4-e4b` | 2 replicas | 4 × 128K | 42 × 32K |
-| `qwen35-4b` | 2 replicas | 4 × 128K | 18 × 32K |
-| `qwen35-9b` | 2 replicas | 4 × 112K | 14 × 32K |
-| `gemma-4-e4b-q8` | 2 replicas | 4 × 128K | 34 × 32K |
-| `qwen35-4b-q8` | 2 replicas | 4 × 128K | 14 × 32K |
-| `qwen35-9b-q8` | 2 replicas | 4 × 80K | 8 × 32K |
-| `gemma-4-12b` | 2 replicas | 4 × 192K | 14 × 32K |
-| `gemma-4-26b-a4b` | split | 4 × 128K | 14 × 32K |
-| `qwen38-27b` | split | 4 × 40K | 4 × 32K |
+A model that doesn't fit one T4 at a profile's context is split across both GPUs. A model that doesn't fit even split is left out of that file. The KV cache stays in f16, so quality isn't reduced.
 
-Gemma 4 E2B and E4B are trained for 128K, so their long-context limit is the model's own. Each preset pins a revision and sha256 and uses MTP speculative decoding. `kis up <model> --parallel N --ctx N` overrides a preset for one run. After a llama.cpp update or for new presets, rerun `kis calibrate [model...]`.
+Measured with `kis calibrate` on Kaggle's 2× T4 (llama.cpp v0.6.0). Each cell shows slots × context per slot, then decode speed: one request alone / all slots busy (total tok/s). Speeds come from short prompts with 256 generated tokens and MTP; long contexts decode slower.
+
+<!-- calibration -->
+| model | 32k | 64k | 96k | 128k | max |
+| --- | --- | --- | --- | --- | --- |
+| `gemma-4-e2b` | 64 x 32K<br>94.2 / 684.6 tok/s | 64 x 64K<br>104.3 / 706.6 tok/s | 44 x 96K<br>103.5 / 627.8 tok/s | 32 x 128K<br>110.0 / 608.6 tok/s | 32 x 128K<br>99.0 / 680.6 tok/s |
+| `gemma-4-e4b` | 42 x 32K<br>65.8 / 587.8 tok/s | 22 x 64K<br>68.3 / 498.0 tok/s | 14 x 96K<br>62.3 / 429.6 tok/s | 10 x 128K<br>77.4 / 386.6 tok/s | 10 x 128K<br>67.0 / 380.8 tok/s |
+| `qwen35-4b` | 18 x 32K<br>44.1 / 203.8 tok/s | 8 x 64K<br>49.6 / 184.2 tok/s | 6 x 96K<br>43.1 / 163.4 tok/s | 4 x 128K<br>47.5 / 124.4 tok/s | 2 x 256K<br>42.4 / 89.4 tok/s |
+| `qwen35-9b` | 14 x 32K<br>22.6 / 153.4 tok/s | 6 x 64K<br>29.8 / 125.8 tok/s | 4 x 96K<br>27.2 / 71.4 tok/s | 2 x 128K<br>30.2 / 56.0 tok/s | 1 x 256K split<br>34.7 / 37.1 tok/s |
+| `gemma-4-e4b-q8` | 32 x 32K<br>37.4 / 473.6 tok/s | 16 x 64K<br>46.9 / 392.8 tok/s | 10 x 96K<br>44.7 / 301.8 tok/s | 8 x 128K<br>46.6 / 258.4 tok/s | 8 x 128K<br>45.9 / 255.8 tok/s |
+| `qwen35-4b-q8` | 14 x 32K<br>40.3 / 196.2 tok/s | 8 x 64K<br>47.3 / 175.4 tok/s | 4 x 96K<br>43.5 / 120.8 tok/s | 4 x 128K<br>45.9 / 127.0 tok/s | 2 x 256K<br>40.5 / 83.0 tok/s |
+| `qwen35-9b-q8` | 8 x 32K<br>23.1 / 119.0 tok/s | 4 x 64K<br>27.3 / 75.8 tok/s | 2 x 96K<br>25.3 / 50.0 tok/s | 2 x 128K<br>27.5 / 57.4 tok/s | 1 x 256K split<br>32.9 / 30.4 tok/s |
+| `gemma-4-12b` | 14 x 32K<br>29.6 / 211.8 tok/s | 10 x 64K<br>33.2 / 206.4 tok/s | 6 x 96K<br>30.1 / 142.2 tok/s | 4 x 128K<br>30.9 / 90.8 tok/s | 2 x 256K<br>25.8 / 51.0 tok/s |
+| `gemma-4-26b-a4b` | 14 x 32K split<br>68.6 / 121.7 tok/s | 8 x 64K split<br>69.3 / 116.1 tok/s | 5 x 96K split<br>66.3 / 108.0 tok/s | 4 x 128K split<br>69.4 / 108.2 tok/s | 2 x 256K split<br>62.6 / 77.2 tok/s |
+| `qwen38-27b` | 4 x 32K split<br>12.0 / 29.9 tok/s | 2 x 64K split<br>13.1 / 15.2 tok/s | 1 x 96K split<br>13.1 / 11.6 tok/s | 1 x 128K split<br>12.7 / 12.1 tok/s | 1 x 176K split<br>14.1 / 12.4 tok/s |
+<!-- /calibration -->
+
+Calibration stops at 32 slots per llama-server instance, so `gemma-4-e2b` at 32K and 64K would fit more slots. "split" means one instance across both GPUs; otherwise each GPU runs a replica. With one slot alone, decode speed is set mostly by model size, not context size.
+
+Each preset pins a revision and sha256. `kis up <model> --parallel N --ctx N` overrides a preset for one run. After a llama.cpp update, or to add presets, run `kis calibrate --write [model...]`; it regenerates `examples/` and this table.
 
 ## Tunnels
 
@@ -108,7 +183,7 @@ Cloudflare cuts a request whose response hasn't started within 100 s, such as a 
 ## Docker
 
 ```bash
-cp config.example.toml config.toml && mkdir -p .kis
+cp examples/config.32k.toml config.toml && mkdir -p .kis
 docker compose run --rm kis up qwen35-4b
 docker compose up -d     # proxy on 127.0.0.1:8080
 ```

@@ -22,7 +22,7 @@ def server():
 
 @pytest.fixture
 def config():
-    data = tomllib.loads((ROOT / "config.example.toml").read_text())
+    data = tomllib.loads((ROOT / "examples" / "config.32k.toml").read_text())
     data["kaggle"]["username"] = "tester"
     return data
 
@@ -70,3 +70,10 @@ async def llama_servers(aiohttp_server):
 @pytest.fixture
 async def balancer(server, llama_servers):
     return server.Balancer([s.port for s in llama_servers], api_key="secret")
+
+
+@pytest.fixture(autouse=True)
+def no_retry_delay(monkeypatch):
+    from kis import retry
+
+    monkeypatch.setattr(retry, "DELAYS", (0.0,))

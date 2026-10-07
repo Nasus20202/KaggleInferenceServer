@@ -4,18 +4,25 @@ OpenAI-compatible, API-key protected balancer, exposed through a tunnel.
   replicas  model fits one T4 -> one llama-server per GPU (about 2x aggregate tok/s)
   split     larger model      -> one llama-server across both GPUs
 
-Started by `kis up <model>`, which fills in CONFIG. Status events and the
-endpoint URL go to a private ntfy.sh topic. The session stops after
-`idle_minutes` without requests, after `max_hours`, or on POST /admin/shutdown.
+Started by `kis up <model>`, which fills in CONFIG. Status events, the endpoint
+URL and a periodic stats heartbeat go to a private ntfy.sh topic; everything is
+also logged with timestamps to the kernel log and /kaggle/working/server.log
+(one line per request). Authenticated routes: GET /admin/stats (GPU memory and
+load, slots, requests), GET /admin/logs?file=...&lines=N, POST /admin/shutdown.
+The session stops after `idle_minutes` without requests, after `max_hours`, or
+on /admin/shutdown.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -28,11 +35,13 @@ from aiohttp import web
 CONFIG = {
     "api_key": "change-me",
     "ntfy_topic": "",
+    "session": "",  # id in every event; `kis` tells sessions apart during a rollover
     "tunnel": {"kind": "cloudflared"},
     "idle_minutes": 30,
     "max_hours": 11.5,
     "replica_max_gb": 11.0,
     "ctx": 32768,
+    "max_queue": None,  # requests waiting beyond the slots before 429; None = no limit
     "args": ["--n-gpu-layers", "999", "--flash-attn", "auto", "--metrics"],
     "model": {
         "repo": "unsloth/Qwen3.5-4B-MTP-GGUF",
@@ -50,18 +59,29 @@ MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tm
 PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
+STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
 STARTED = time.time()
+RUNTIME = {}  # topology, slots, parallel and ctx of the running backends
+log = logging.getLogger("kis")
+
+
+def setup_logging():
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(WORK / "server.log")):
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
+    log.setLevel(logging.INFO)
 
 
 def notify(event: str, **data):
-    """Print a status event and publish it to the ntfy topic that `kis` follows."""
-    msg = json.dumps({"event": event, "t": round(time.time() - STARTED), **data})
-    print(msg, flush=True)
+    """Log a status event and publish it to the ntfy topic that `kis` follows."""
+    msg = json.dumps({"event": event, "t": round(time.time() - STARTED), "session": CONFIG["session"], **data})
+    log.info("event %s", msg)
     if CONFIG["ntfy_topic"]:
         try:
             urllib.request.urlopen(f"https://ntfy.sh/{CONFIG['ntfy_topic']}", data=msg.encode(), timeout=10)
         except OSError as e:
-            print("ntfy failed:", e, flush=True)
+            log.warning("ntfy failed: %s", e)
 
 
 def log_file(name: str):
@@ -155,11 +175,23 @@ def plan(gpus: list[str], size_gb: float, topology: str | None, replica_max_gb: 
 OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
 
 
-def gpu_memory() -> dict[str, str]:
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader"], text=True
-    )
-    return {i: f"{used} / {total}" for i, used, total in (line.split(", ") for line in out.strip().splitlines())}
+def gpu_stats() -> list[dict]:
+    """Memory (MiB) and utilization (%) of each GPU; empty if nvidia-smi fails."""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("nvidia-smi failed: %s", e)
+        return []
+    keys = ("gpu", "used_mib", "total_mib", "util_pct")
+    return [dict(zip(keys, map(int, line.split(", ")), strict=True)) for line in out.strip().splitlines()]
 
 
 def start_backends(model_path: str, draft_path: str | None) -> dict[int, subprocess.Popen]:
@@ -190,15 +222,8 @@ def start_backends(model_path: str, draft_path: str | None) -> dict[int, subproc
             continue
         notify("error", error="llama-server failed to start (lower --ctx or --parallel?)", log=log)
         raise RuntimeError("llama-server failed to start")
-    notify(
-        "backends_ready",
-        topology=topology,
-        model_gb=round(size_gb, 2),
-        slots=parallel * len(groups),
-        parallel=parallel,
-        ctx=ctx,
-        gpu_mib=gpu_memory(),
-    )
+    RUNTIME.update(topology=topology, slots=parallel * len(groups), parallel=parallel, ctx=ctx)
+    notify("backends_ready", model_gb=round(size_gb, 2), **RUNTIME, gpus=gpu_stats())
     return backends
 
 
@@ -215,6 +240,82 @@ HOP_HEADERS = {
 }
 
 
+CAPTURE_BYTES = 256 << 10  # tail of each response kept to read its usage and timings
+
+
+def parse_usage(body: bytes, sse: bool) -> dict | None:
+    """Tokens and timings of one completion from llama-server's `usage` and `timings`
+    (in the JSON body, or in the last events of an SSE stream); None if absent."""
+    docs = []
+    if sse:
+        for line in reversed(body.splitlines()):
+            if line.startswith(b"data: {"):
+                with contextlib.suppress(ValueError):
+                    docs.append(json.loads(line[6:]))
+            if len(docs) >= 3:
+                break
+    else:
+        with contextlib.suppress(ValueError):
+            docs.append(json.loads(body))
+    usage = next((d["usage"] for d in docs if isinstance(d, dict) and d.get("usage")), None)
+    timings = next((d["timings"] for d in docs if isinstance(d, dict) and d.get("timings")), None)
+    if not usage and not timings:
+        return None
+    usage, timings = usage or {}, timings or {}
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", timings.get("cache_n", 0))
+    return {
+        "model": next((d["model"] for d in docs if isinstance(d, dict) and d.get("model")), None),
+        "in": usage.get("prompt_tokens", timings.get("prompt_n", 0) + timings.get("cache_n", 0)),
+        "out": usage.get("completion_tokens", timings.get("predicted_n", 0)),
+        "cached": cached or 0,
+        "prefill_n": timings.get("prompt_n", 0),
+        "prefill_ms": timings.get("prompt_ms", 0.0),
+        "decode_ms": timings.get("predicted_ms", 0.0),
+        "draft_n": timings.get("draft_n", 0),
+        "draft_accepted": timings.get("draft_n_accepted", 0),
+    }
+
+
+def describe(u: dict) -> str:
+    """One log fragment: tokens and speeds of a completion."""
+    text = f"in={u['in']} cached={u['cached']} out={u['out']}"
+    if u["prefill_ms"]:
+        text += f" prefill={u['prefill_n'] / u['prefill_ms'] * 1000:.0f}tok/s"
+    if u["decode_ms"]:
+        text += f" decode={u['out'] / u['decode_ms'] * 1000:.1f}tok/s"
+    if u["draft_n"]:
+        text += f" draft={u['draft_accepted'] / u['draft_n']:.0%}"
+    return text
+
+
+class Usage:
+    """Running totals of completions for one model."""
+
+    FIELDS = ("in", "out", "cached", "prefill_n", "prefill_ms", "decode_ms", "draft_n", "draft_accepted")
+
+    def __init__(self):
+        self.requests = 0
+        self.totals = dict.fromkeys(self.FIELDS, 0)
+
+    def add(self, u: dict):
+        self.requests += 1
+        for key in self.FIELDS:
+            self.totals[key] += u[key]
+
+    def summary(self) -> dict:
+        t = self.totals
+        return {
+            "requests": self.requests,
+            "tokens_in": t["in"],
+            "tokens_out": t["out"],
+            "tokens_cached": t["cached"],
+            "cache_rate": round(t["cached"] / t["in"], 3) if t["in"] else None,
+            "prefill_tps": round(t["prefill_n"] / t["prefill_ms"] * 1000, 1) if t["prefill_ms"] else None,
+            "decode_tps": round(t["out"] / t["decode_ms"] * 1000, 1) if t["decode_ms"] else None,
+            "draft_acceptance": round(t["draft_accepted"] / t["draft_n"], 3) if t["draft_n"] else None,
+        }
+
+
 class Balancer:
     """Checks the API key and sends each request to the instance with the fewest in flight."""
 
@@ -223,6 +324,8 @@ class Balancer:
         self.api_key = api_key
         self.last_activity = time.time()
         self.stop = asyncio.Event()
+        self.requests = self.errors = 0
+        self.usage: dict[str, Usage] = {}
 
     @property
     def idle_seconds(self) -> float:
@@ -253,19 +356,78 @@ class Balancer:
         if req.headers.get("Authorization") != f"Bearer {self.api_key}":
             return web.json_response({"error": {"message": "invalid api key"}}, status=401)
         if req.path == "/admin/shutdown":
+            # With a named tunnel, two sessions share one URL during a rollover: only stop the one asked for.
+            if req.query.get("session", CONFIG["session"]) != CONFIG["session"]:
+                return web.json_response({"error": {"message": "other session"}, "session": CONFIG["session"]}, 409)
+            log.info("shutdown requested")
             self.stop.set()
-            return web.json_response({"status": "stopping"})
+            return web.json_response({"status": "stopping", "session": CONFIG["session"]})
+        if req.path == "/admin/stats":
+            return web.json_response(await self.stats())
+        if req.path == "/admin/logs":
+            return self.logs(req)
+        if self.full():
+            log.warning("%s %s 429 (all slots busy, queue full)", req.method, req.path)
+            return web.json_response(
+                {"error": {"message": "server busy: all slots in use and the queue is full", "type": "rate_limit"}},
+                status=429,
+                headers={"Retry-After": "5"},
+            )
         port = min(self.inflight, key=lambda p: self.inflight[p])
         self.inflight[port] += 1
-        self.last_activity = time.time()
+        self.requests += 1
+        self.last_activity = start = time.time()
+        status, detail = "-", ""
         try:
-            return await self.forward(req, f"http://127.0.0.1:{port}{req.rel_url}")
+            resp, sse, captured = await self.forward(req, f"http://127.0.0.1:{port}{req.rel_url}")
+            status = resp.status
+            if status >= 500:
+                self.errors += 1
+            if req.method == "POST" and (u := parse_usage(bytes(captured), sse)):
+                self.usage.setdefault(u["model"] or MODEL["alias"], Usage()).add(u)
+                detail = " " + describe(u)
+            return resp
+        except Exception:
+            self.errors += 1
+            log.exception("%s %s -> :%d failed", req.method, req.path, port)
+            raise
         finally:
             self.inflight[port] -= 1
             self.last_activity = time.time()
+            log.info("%s %s -> :%d %s %.2fs%s", req.method, req.path, port, status, time.time() - start, detail)
 
-    async def forward(self, req: web.Request, url: str) -> web.StreamResponse:
-        """Proxy one request, streaming the response (SSE included) chunk by chunk.
+    def full(self) -> bool:
+        """True when max_queue is set and that many requests already wait beyond the slots."""
+        limit = CONFIG.get("max_queue")
+        slots = RUNTIME.get("slots", len(self.inflight))
+        return limit is not None and sum(self.inflight.values()) >= slots + limit
+
+    async def stats(self) -> dict:
+        return {
+            "session": CONFIG["session"],
+            "model": MODEL["alias"],
+            **RUNTIME,
+            "uptime_s": round(time.time() - STARTED),
+            "idle_s": round(self.idle_seconds),
+            "inflight": sum(self.inflight.values()),
+            "requests": self.requests,
+            "errors": self.errors,
+            "usage": {model: u.summary() for model, u in self.usage.items()},
+            "gpus": await asyncio.to_thread(gpu_stats),
+        }
+
+    def logs(self, req: web.Request) -> web.Response:
+        """Last `lines` lines of server.log or a llama-server log (llama-8090.log, ...)."""
+        name = req.query.get("file", "server.log")
+        if not re.fullmatch(r"[\w-]+\.log", name) or not (WORK / name).is_file():
+            files = sorted(p.name for p in WORK.glob("*.log"))
+            return web.json_response({"error": {"message": f"no log {name!r}; available: {files}"}}, status=404)
+        lines = (WORK / name).read_text(errors="replace").splitlines()[-int(req.query.get("lines", 200)) :]
+        return web.Response(text="\n".join(lines) + "\n")
+
+    async def forward(self, req: web.Request, url: str) -> tuple[web.StreamResponse, bool, bytearray]:
+        """Proxy one request, streaming the response (SSE included) chunk by chunk; return
+        the response, whether it is SSE, and the tail of its body (for usage stats).
 
         Cloudflare drops requests whose response doesn't start within 100 s (HTTP 524),
         e.g. a non-streaming completion of a long prompt. If the backend hasn't answered
@@ -277,7 +439,7 @@ class Balancer:
         sse = b'"stream":true' in body.replace(b" ", b"")
         request = self.session.request(req.method, url, data=body, headers=headers)
         pending = asyncio.ensure_future(request.__aenter__())
-        resp = None
+        resp, captured = None, bytearray()
         try:
             while not (await asyncio.wait({pending}, timeout=KEEPALIVE_SECONDS))[0]:
                 if resp is None:
@@ -294,6 +456,8 @@ class Balancer:
                 await resp.prepare(req)
             async for chunk in upstream.content.iter_any():
                 await resp.write(chunk)
+                captured += chunk
+                del captured[:-CAPTURE_BYTES]
             await resp.write_eof()
         except ConnectionResetError:  # client went away; closing upstream stops generation
             pass
@@ -302,7 +466,7 @@ class Balancer:
                 await request.__aexit__(None, None, None)
             else:
                 pending.cancel()
-        return resp
+        return resp, sse, captured
 
 
 # --------------------------------------------------------------------------- tunnels
@@ -323,6 +487,7 @@ def cloudflared(tunnel: dict, on_ready):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         announced = False
         for line in proc.stdout or []:
+            log.info("cloudflared: %s", line.rstrip())
             quick = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
             url = (
                 quick.group(0)
@@ -383,9 +548,12 @@ async def serve(backends: dict[int, subprocess.Popen]) -> str:
     on_ready = lambda url: notify("ready", endpoint=url, model=MODEL["alias"], tunnel=tunnel["kind"])  # noqa: E731
     threading.Thread(target=TUNNELS[tunnel["kind"]], args=(tunnel, on_ready), daemon=True).start()
 
-    reason = "shutdown requested"
+    reason, last_stats = "shutdown requested", time.time()
     while not balancer.stop.is_set():
         await asyncio.sleep(20)
+        if time.time() - last_stats > STATS_MINUTES * 60:
+            last_stats = time.time()
+            notify("stats", **await balancer.stats())
         if balancer.idle_seconds > CONFIG["idle_minutes"] * 60:
             reason = f"idle for {CONFIG['idle_minutes']} min"
         elif time.time() - STARTED > CONFIG["max_hours"] * 3600:
@@ -400,6 +568,7 @@ async def serve(backends: dict[int, subprocess.Popen]) -> str:
 
 
 def main():
+    setup_logging()
     notify("starting", model=MODEL["alias"])
     model_path = fetch(MODEL["file"], MODEL.get("sha256"))
     draft_path = fetch(MODEL["draft_file"], MODEL.get("draft_sha256")) if MODEL.get("draft_file") else None

@@ -1,5 +1,4 @@
-# Throughput profile: many slots, 32K context each. Copy to config.toml (gitignored)
-# and fill in [kaggle].username.
+# Copy one of examples/config.*.toml to config.toml (gitignored) and fill in [kaggle].username.
 
 [kaggle]
 username = "your-kaggle-username"
@@ -27,7 +26,12 @@ hostname = "kaggle-llm"
 [server]
 # The kernel exits on its own (saving GPU quota) after this much inactivity / total time.
 idle_minutes = 30
-max_hours = 11.5
+max_hours = 11.5   # Kaggle ends a session after 12 h; also capped at 2 min before the GPU quota runs out
+# `kis proxy` replaces a session this old with a fresh one, without downtime (0 = off).
+rollover_hours = 11.0
+# Requests that may wait beyond the slots before the server answers 429 (Retry-After: 5).
+# Unset = no limit (llama-server queues them).
+# max_queue = 8
 # Replicate the model on each GPU when its files are at most this size; otherwise
 # split one instance across both GPUs. Per-model `topology` overrides it.
 replica_max_gb = 11.0
@@ -49,11 +53,11 @@ args = [
 ]
 
 # ---------------------------------------------------------------------------
-# Model presets, throughput profile: as many slots as fit a T4 (`kis calibrate`)
-# with 32K tokens of context each. With 2 replicas, total slots = 2 x parallel.
-# For fewer slots with longer context use config.example.toml.
-# `parallel` = slots per llama-server instance; `alias` is the model name the API
-# reports. Sampling follows each model card. KV cache stays f16 (no quality loss).
+# Model presets, profile 128k: 128K tokens of context per slot, as many slots as fit.
+# Measured on Kaggle's 2x T4 with `kis calibrate`; `kis calibrate --write` regenerates
+# this file. `parallel` = slots per llama-server instance (2 replicas -> 2x slots),
+# `ctx` = context each slot is guaranteed. KV cache in f16 (no quality loss).
+# `alias` is the model name the API reports. Sampling follows each model card.
 # ---------------------------------------------------------------------------
 
 # --- Small models (2 replicas) ---
@@ -66,8 +70,8 @@ sha256 = "e531007218dfab990486a5de7676a6932d6ea8dea233d1f698d7c21cf8a16889"
 draft_file = "MTP/mtp-gemma-4-E2B-it-Q8_0.gguf"
 draft_sha256 = "6d1d359ac7a5411a046236a1a687f207ebad50475d484235b95946ef329360cc"
 alias = "gemma-4-E2B-it-qat-UD-Q4_K_XL"
-parallel = 32
-ctx = 32768
+parallel = 16
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
@@ -80,8 +84,8 @@ sha256 = "df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3"
 draft_file = "MTP/mtp-gemma-4-E4B-it-Q8_0.gguf"
 draft_sha256 = "c566f6885963c83a0d868f9656287ed5d4f12a2b8f0c86a20524f89a96169ed2"
 alias = "gemma-4-E4B-it-qat-UD-Q4_K_XL"
-parallel = 21
-ctx = 32768
+parallel = 5
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
@@ -92,8 +96,8 @@ revision = "86835bf9949e4d14d6860f7910b1340ad4f271a9"
 file = "Qwen3.5-4B-Q4_K_M.gguf"
 sha256 = "3874209241c9a397e2f62cd3f70f80fd2dfbf0dfccb6838416bdb48a714e8630"
 alias = "Qwen3.5-4B-Q4_K_M"
-parallel = 9
-ctx = 32768
+parallel = 2
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
         "--presence-penalty", "1.5", "--repeat-penalty", "1.0"]
@@ -104,8 +108,8 @@ revision = "9716a636ee4bddc3fed678220b7a33dd2a4160ae"
 file = "Qwen3.5-9B-Q4_K_M.gguf"
 sha256 = "e8dd94817e95d6c0939102049d068418269978377b13616c4726235e232841fe"
 alias = "Qwen3.5-9B-Q4_K_M"
-parallel = 7
-ctx = 32768
+parallel = 1
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
         "--presence-penalty", "1.5", "--repeat-penalty", "1.0"]
@@ -120,8 +124,8 @@ sha256 = "f8854aa4480df62585a279e7ca0a881554fc18a41c59c4f62642d16a2ae47012"
 draft_file = "MTP/mtp-gemma-4-E4B-it-Q8_0.gguf"
 draft_sha256 = "b6a723115efa510d3b3215db1e26790dae84cd08c2134a764f3d194f1f0c3376"
 alias = "gemma-4-E4B-it-Q8_0"
-parallel = 17
-ctx = 32768
+parallel = 4
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
@@ -132,8 +136,8 @@ revision = "86835bf9949e4d14d6860f7910b1340ad4f271a9"
 file = "Qwen3.5-4B-Q8_0.gguf"
 sha256 = "4f40ff26e3b6e23888e520e9c33d9a309d919b940cd1375b421710c6cb6cc8dd"
 alias = "Qwen3.5-4B-Q8_0"
-parallel = 7
-ctx = 32768
+parallel = 2
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
         "--presence-penalty", "1.5", "--repeat-penalty", "1.0"]
@@ -144,8 +148,8 @@ revision = "9716a636ee4bddc3fed678220b7a33dd2a4160ae"
 file = "Qwen3.5-9B-Q8_0.gguf"
 sha256 = "107125cda29dc42d62f5ba8ffac8817d21a9d7bd06c1b35860491a00a170ad4e"
 alias = "Qwen3.5-9B-Q8_0"
-parallel = 4
-ctx = 32768
+parallel = 1
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
         "--presence-penalty", "1.5", "--repeat-penalty", "1.0"]
@@ -160,8 +164,8 @@ sha256 = "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
 draft_file = "MTP/mtp-gemma-4-12B-it-Q8_0.gguf"
 draft_sha256 = "f58dff98ecf17079c364b1205954ba85763a00ad076c5595040db0a828eaec1b"
 alias = "gemma-4-12B-it-qat-UD-Q4_K_XL"
-parallel = 7
-ctx = 32768
+parallel = 2
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
@@ -174,10 +178,10 @@ sha256 = "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
 draft_file = "MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
 draft_sha256 = "75f58e20c32281d1adc086c0569d53f147e8d81a7b8493cf4a73a028415f67af"
 alias = "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL"
-topology = "split"
 tensor_split = "21,19"  # GPU 1 also holds the output layer
-parallel = 14
-ctx = 32768
+topology = "split"
+parallel = 4
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
@@ -190,10 +194,10 @@ sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
 draft_file = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
 draft_sha256 = "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e"
 alias = "Qwen3.8-27B-UD-Q4_K_M"
-topology = "split"
 tensor_split = "5,4"  # GPU 1 also holds the output layer
-parallel = 4
-ctx = 32768
+topology = "split"
+parallel = 1
+ctx = 131072
 args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
         "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
         "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]

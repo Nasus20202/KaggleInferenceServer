@@ -15,7 +15,7 @@ def load_config() -> dict:
     """config.toml, or the file named by KIS_CONFIG."""
     path = Path(os.environ.get("KIS_CONFIG") or ROOT / "config.toml")
     if not path.exists():
-        sys.exit(f"{path} missing: cp config.example.toml config.toml and set kaggle.username")
+        sys.exit(f"{path} missing: cp examples/config.32k.toml config.toml and set kaggle.username")
     config = tomllib.loads(path.read_text())
     if config["kaggle"]["username"] == "your-kaggle-username":
         sys.exit("set kaggle.username in config.toml")

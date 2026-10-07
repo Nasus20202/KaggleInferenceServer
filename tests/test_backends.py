@@ -29,7 +29,7 @@ def backends(server, monkeypatch, tmp_path):
     monkeypatch.setattr(server, "llama_server_binary", lambda: "llama-server")
     monkeypatch.setattr(server.subprocess, "check_output", lambda *a, **k: "0\n1\n")
     monkeypatch.setattr(server.os.path, "getsize", lambda p: 3e9)
-    monkeypatch.setattr(server, "gpu_memory", dict)
+    monkeypatch.setattr(server, "gpu_stats", list)
     monkeypatch.setattr(server, "launch", launch)
     monkeypatch.setattr(server, "wait_healthy", lambda port, proc: proc.parallel <= state["fits"])
     monkeypatch.setattr(server, "notify", lambda event, **data: state["events"].append((event, data)))

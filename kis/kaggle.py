@@ -4,13 +4,18 @@ import json
 import pprint
 import re
 import subprocess
-import sys
+import time
 
+from . import retry
 from .settings import ROOT, STATE_DIR
 
 BUILD = "kis-llamacpp-build"
 SERVER = "kis-server"
 CALIBRATE = "kis-calibrate"
+
+
+class KaggleError(RuntimeError):
+    pass
 
 
 def kernel_id(config: dict, slug: str) -> str:
@@ -62,13 +67,24 @@ def push(config: dict, slug: str, script: str, params: dict, sources: list[str] 
         result = _cli("kernels", "push", "-p", str(folder))
     print((result.stdout + result.stderr).strip())
     if result.returncode or "error" in result.stdout.lower():
-        sys.exit("kaggle push failed")
+        raise KaggleError(f"kaggle push of {slug} failed")
 
 
 def status(config: dict, slug: str) -> str:
     """Kernel status line (running / complete / error / cancel...) or the CLI's error text."""
-    result = _cli("kernels", "status", kernel_id(config, slug))
+    for attempt in range(retry.ATTEMPTS):
+        result = _cli("kernels", "status", kernel_id(config, slug))
+        permanent = "Cannot access kernel" in result.stdout + result.stderr  # e.g. not created yet
+        if result.returncode == 0 or permanent or attempt == retry.ATTEMPTS - 1:
+            break
+        time.sleep(retry.backoff(attempt))  # Kaggle API hiccup
     return (result.stdout + result.stderr).strip()
+
+
+def state(config: dict, slug: str) -> str:
+    """running / complete / error / cancel... or "-" if the kernel doesn't exist (yet)."""
+    m = re.search(r'has status "(?:KernelWorkerStatus\.)?(\w+)"', status(config, slug))
+    return m.group(1).lower() if m else "-"
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess:

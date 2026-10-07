@@ -17,4 +17,6 @@ services:
       - ${HOME}/.kaggle:/home/kis/.kaggle:ro
     environment:
       HOME: /home/kis
+      KIS_PROXY_API_KEY: ${KIS_PROXY_API_KEY:-} # optional: clients must send this key
+      KIS_LOG_LEVEL: ${KIS_LOG_LEVEL:-INFO}
     restart: unless-stopped

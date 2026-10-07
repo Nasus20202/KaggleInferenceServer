@@ -103,3 +103,55 @@ async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server,
     lines = [line async for line in resp.content if line.strip()]
     assert lines[0].startswith(b": keepalive") and lines[-1].strip() == b"data: [DONE]"
     assert all(n == 0 for n in balancer.inflight.values())
+
+
+async def test_stats_need_the_key_and_report_gpus_and_requests(aiohttp_client, balancer, server, monkeypatch):
+    monkeypatch.setattr(server, "gpu_stats", lambda: [{"gpu": 0, "used_mib": 9000, "total_mib": 15360}])
+    client = await aiohttp_client(balancer.app())
+    assert (await client.get("/admin/stats")).status == 401
+    await client.post("/v1/chat/completions", json={}, headers=AUTH)
+    stats = await (await client.get("/admin/stats", headers=AUTH)).json()
+    assert stats["requests"] == 1 and stats["inflight"] == 0
+    assert stats["gpus"][0]["used_mib"] == 9000
+
+
+async def test_logs_tail_only_log_files(aiohttp_client, balancer, server, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "WORK", tmp_path)
+    (tmp_path / "llama-8090.log").write_text("".join(f"line {i}\n" for i in range(10)))
+    client = await aiohttp_client(balancer.app())
+    resp = await client.get("/admin/logs?file=llama-8090.log&lines=2", headers=AUTH)
+    assert await resp.text() == "line 8\nline 9\n"
+    for name in ("../secrets.log", "config.toml", "missing.log"):
+        resp = await client.get(f"/admin/logs?file={name}", headers=AUTH)
+        assert resp.status == 404
+
+
+async def test_logs_each_request(aiohttp_client, balancer, caplog):
+    client = await aiohttp_client(balancer.app())
+    with caplog.at_level("INFO", logger="kis"):
+        await client.post("/v1/chat/completions", json={}, headers=AUTH)
+    assert any("POST /v1/chat/completions -> :" in r.getMessage() and " 200 " in r.getMessage() for r in caplog.records)
+
+
+async def test_stats_include_token_usage_per_model(aiohttp_client, balancer, server, monkeypatch, caplog):
+    monkeypatch.setattr(server, "gpu_stats", list)
+    client = await aiohttp_client(balancer.app())
+    with caplog.at_level("INFO", logger="kis"):
+        for tokens in (3, 5):
+            await client.post("/v1/chat/completions", json={"max_tokens": tokens}, headers=AUTH)
+    usage = (await (await client.get("/admin/stats", headers=AUTH)).json())["usage"]
+    assert usage[server.MODEL["alias"]]["tokens_out"] == 8
+    assert any("out=5" in r.getMessage() for r in caplog.records)
+
+
+async def test_max_queue_answers_429_when_full(aiohttp_client, balancer, server, monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "max_queue", 1)
+    monkeypatch.setitem(server.RUNTIME, "slots", 2)  # 2 slots + 1 waiting = 3 accepted at once
+    client = await aiohttp_client(balancer.app())
+    resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
+    assert sorted(r.status for r in resps) == [200, 200, 200, 429, 429]
+    busy = next(r for r in resps if r.status == 429)
+    assert busy.headers["Retry-After"] == "5"
+    monkeypatch.setitem(server.CONFIG, "max_queue", None)
+    resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
+    assert {r.status for r in resps} == {200}

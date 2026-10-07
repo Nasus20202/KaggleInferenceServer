@@ -4,16 +4,21 @@ kis build              compile llama-server for T4 once
 kis up qwen35-9b       start the server kernel and wait for its endpoint
 kis proxy              local endpoint http://127.0.0.1:8080/v1 (any API key)
 kis bench              aggregate tok/s vs concurrency
-kis calibrate          measure context and slot limits of each preset on the T4s
+kis calibrate          measure slots, context and speed of each preset on the T4s
+kis status             GPU quota, kernels, VRAM and load of the running server
+kis rollover           replace the running session without downtime (kis proxy does it on its own)
 kis logs | env | down
 """
 
 import argparse
+import logging
+import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
-from . import bench, events, kaggle, proxy
+from . import bench, events, kaggle, profiles, proxy, retry, rollover, status
 from .settings import load_config, load_secrets, load_state, save_state
 
 
@@ -55,8 +60,10 @@ def server_params(args, config, secrets) -> dict:
             "tunnel": tunnel,
             "idle_minutes": server["idle_minutes"],
             "max_hours": server["max_hours"],
+            "session": "",
             "replica_max_gb": server["replica_max_gb"],
             "ctx": server["ctx"],
+            "max_queue": server.get("max_queue"),
             "args": server["args"],
             "model": model,
         }
@@ -81,19 +88,25 @@ def cmd_up(args, config):
     params = server_params(args, config, secrets)
     if (url := events.endpoint(config, secrets["ntfy_topic"])) and not args.force:
         sys.exit(f"a server is already up at {url}; `kis down` first (or --force)")
+    q = status.quota()
+    print(status.format_quota(q))
+    if q and q["total_h"] - q["used_h"] < 0.5:
+        print("! less than 30 min of GPU quota left; the session stops 2 min before it runs out")
     since = str(int(time.time()))
-    kaggle.push(config, kaggle.SERVER, "server.py", params, sources=[kaggle.kernel_id(config, kaggle.BUILD)])
-    save_state(model=params["CONFIG"]["model"]["alias"], since=since)
-    print(f"kernel: {kaggle.kernel_url(config, kaggle.SERVER)}")
-    follow(config, secrets["ntfy_topic"], since, until_ready=True)
+    slug = load_state().get("slug", kaggle.SERVER)
+    session = rollover.launch(config, params, slug)
+    print(f"kernel: {kaggle.kernel_url(config, slug)}  session: {session}")
+    follow(config, secrets["ntfy_topic"], since, until_ready=True, session=session, slug=slug)
 
 
-def follow(config, topic: str, since: str, until_ready: bool = False):
-    """Print events; with until_ready, return on `ready` and exit on failure."""
+def follow(config, topic: str, since: str, until_ready: bool = False, session: str | None = None, slug: str = ""):
+    """Print events (of one session, if given); with until_ready, return on `ready` and exit on failure."""
     last_status_check = time.time()
     while True:
         for msg_id, event in events.fetch(topic, since):
             since = msg_id
+            if session and event.get("session") != session:
+                continue
             events.show(event)
             if until_ready and event["event"] == "ready":
                 print(f"\nready: {event['endpoint']}/v1\nlocal: `kis proxy`, then http://127.0.0.1:8080/v1")
@@ -102,10 +115,18 @@ def follow(config, topic: str, since: str, until_ready: bool = False):
                 sys.exit(1)
         if until_ready and time.time() - last_status_check > 60:  # catches crashes before the first event
             last_status_check = time.time()
-            status = kaggle.status(config, kaggle.SERVER)
-            if any(word in status.lower() for word in ("error", "cancel", "complete")):
-                sys.exit(f"kernel ended: {status}")
+            state = kaggle.status(config, slug or kaggle.SERVER)
+            if any(word in state.lower() for word in ("error", "cancel", "complete")):
+                sys.exit(f"kernel ended: {state}")
         time.sleep(5)
+
+
+def cmd_rollover(args, config):
+    secrets = load_secrets()
+    old, url = rollover.rollover(config, secrets["ntfy_topic"])
+    print(f"new session ready: {url}/v1; draining session {old['session']}")
+    rollover.retire(old["endpoint"], secrets["api_key"], old["session"])
+    print("done")
 
 
 def cmd_calibrate(args, config):
@@ -122,12 +143,9 @@ def cmd_calibrate(args, config):
         "ARGS": _drop_options(server["args"], "--kv-unified-per-slot", "--parallel"),
         "NTFY_TOPIC": topic,
         "REPLICA_MAX_GB": server["replica_max_gb"],
-        "CONTEXT_SLOTS": args.slots,
-        "MIN_CTX": args.min_ctx,
     }
     kaggle.push(config, kaggle.CALIBRATE, "calibrate.py", params, sources=[kaggle.kernel_id(config, kaggle.BUILD)])
-    print(f"kernel: {kaggle.kernel_url(config, kaggle.CALIBRATE)}")
-    results = {}
+    print(f"kernel: {kaggle.kernel_url(config, kaggle.CALIBRATE)} (~10 min per model)")
     while True:
         for msg_id, event in events.fetch(topic, since):
             since = msg_id
@@ -135,39 +153,63 @@ def cmd_calibrate(args, config):
                 continue
             events.show(event)
             if event["event"] == "calibrated":
-                results[event["model"]] = event
                 save_state(calibration={**load_state().get("calibration", {}), event["model"]: event})
             if event["event"] in ("calibration_done", "error"):
-                print(calibration_table(results))
+                results = load_state().get("calibration", {})
+                print(profiles.table(results))
+                if args.write:
+                    profiles.write(results)
+                    print("updated examples/ and the README table")
                 return
         time.sleep(10)
 
 
-def calibration_table(results: dict) -> str:
-    lines = [f"{'model':<18} {'topology':<9} {'context: slots x ctx':>22} {'throughput: slots x ctx':>25}"]
-    for name, r in results.items():
-        c, t = r["context"], r["throughput"]
-        slots_c = (c["parallel"] or 0) * r["instances"]
-        slots_t = (t["parallel"] or 0) * r["instances"]
-        lines.append(
-            f"{name:<18} {r['topology']:<9} {slots_c:>10} x {c['ctx'] or '-':>9} {slots_t:>13} x {t['ctx']:>9}"
-        )
-    return "\n".join(lines)
-
-
 def cmd_logs(args, config):
-    follow(config, load_secrets()["ntfy_topic"], args.since)
-
-
-def cmd_down(args, config):
     secrets = load_secrets()
+    if not args.file:
+        follow(config, secrets["ntfy_topic"], args.since)
+        return
     url = events.endpoint(config, secrets["ntfy_topic"])
     if not url:
         sys.exit("no running server")
     req = urllib.request.Request(
-        f"{url}/admin/shutdown", method="POST", headers={"Authorization": f"Bearer {secrets['api_key']}"}
+        f"{url}/admin/logs?file={args.file}&lines={args.lines}",
+        headers={"Authorization": f"Bearer {secrets['api_key']}"},
     )
-    print(urllib.request.urlopen(req, timeout=30).read().decode())
+    try:
+        print(retry.urlopen(req, timeout=60, what="server log").read().decode(), end="")
+    except urllib.error.HTTPError as e:
+        sys.exit(e.read().decode())
+
+
+def cmd_status(args, config):
+    print(status.format_quota(status.quota()))
+    for slug in (*rollover.SLUGS, kaggle.BUILD, kaggle.CALIBRATE):
+        print(f"{slug}: {kaggle.state(config, slug)}")
+    secrets = load_secrets()
+    url = events.endpoint(config, secrets["ntfy_topic"])
+    if not url:
+        print("server: not running")
+        return
+    print(f"endpoint: {url}/v1")
+    try:
+        print(status.format_stats(status.server_stats(url, secrets["api_key"])))
+    except OSError as e:
+        print(f"stats unavailable: {e}")
+
+
+def cmd_down(args, config):
+    secrets = load_secrets()
+    current = events.current(config, secrets["ntfy_topic"])
+    if not current:
+        sys.exit("no running server")
+    for _ in range(10):  # a named tunnel shared by two sessions may route to the other one: ask again
+        code, body = rollover.admin(
+            current["endpoint"], secrets["api_key"], f"/admin/shutdown?session={current['session']}", "POST"
+        )
+        if code != 409:
+            break
+    print(body)
 
 
 def cmd_env(args, config):
@@ -194,6 +236,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog="kis", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging (or KIS_LOG_LEVEL=DEBUG)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("build", help="compile llama-server for T4 on Kaggle")
@@ -207,14 +250,17 @@ def main():
     p.add_argument("--no-spec", action="store_true", help="disable MTP speculative decoding")
     p.add_argument("--force", action="store_true", help="push even if a server is already up")
 
-    p = sub.add_parser("calibrate", help="measure context and slot limits per model on Kaggle")
+    p = sub.add_parser("calibrate", help="measure slots, context and speed per preset on Kaggle")
     p.add_argument("models", nargs="*", help="presets to measure (default: all)")
-    p.add_argument("--slots", type=int, default=4, help="total slots for the long-context measurement")
-    p.add_argument("--min-ctx", type=int, default=32768, help="context per slot for the slot measurement")
+    p.add_argument("--write", action="store_true", help="regenerate examples/*.toml and the README table")
 
-    p = sub.add_parser("logs", help="follow server events")
-    p.add_argument("--since", default="1h")
+    p = sub.add_parser("logs", help="follow server events, or print a server-side log file")
+    p.add_argument("--since", default="1h", help="events since a duration or unix time")
+    p.add_argument("--file", help="server.log or llama-8090.log, llama-8091.log (running server)")
+    p.add_argument("--lines", type=int, default=200)
+    sub.add_parser("status", help="GPU quota, kernel states, VRAM and load of the running server")
     sub.add_parser("down", help="stop the server now (saves GPU quota)")
+    sub.add_parser("rollover", help="replace the running session with a fresh one, without downtime")
     sub.add_parser("env", help="print OPENAI_* exports for the direct endpoint")
 
     p = sub.add_parser("proxy", help="stable local endpoint")
@@ -228,4 +274,10 @@ def main():
     p.add_argument("--url", help="endpoint base URL (default: current server)")
 
     args = parser.parse_args()
-    globals()[f"cmd_{args.cmd}"](args, load_config())
+    level = "DEBUG" if args.verbose else os.environ.get("KIS_LOG_LEVEL", "INFO")
+    logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)  # the proxy logs its own request lines
+    try:
+        globals()[f"cmd_{args.cmd}"](args, load_config())
+    except (kaggle.KaggleError, rollover.RolloverError) as e:
+        sys.exit(str(e))

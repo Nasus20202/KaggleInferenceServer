@@ -1,16 +1,13 @@
-"""Rendering kernel scripts from config.example.toml, and the model presets."""
+"""Rendering kernel scripts from examples/config.32k.toml, and the model presets."""
 
 import argparse
 import re
-import tomllib
-from pathlib import Path
 
 import pytest
 
 from kis import cli, kaggle
 
 SECRETS = {"api_key": "secret", "ntfy_topic": "test"}
-PROFILES = ("config.example.toml", "config.throughput.example.toml")
 
 
 def up_args(**overrides) -> argparse.Namespace:
@@ -82,16 +79,10 @@ def test_presets_are_complete(config):
             assert "draft_sha256" in preset, f"{name}: unpinned draft"
 
 
-def test_profiles_differ_only_in_slots_and_context():
-    """config.example.toml (long context) and config.throughput.example.toml (many slots)."""
-    root = Path(__file__).resolve().parent.parent
-    context, throughput = (tomllib.loads((root / f).read_text())["models"] for f in PROFILES)
-    assert context.keys() == throughput.keys()
-    for name in context:
-        c, t = context[name], throughput[name]
-        assert {k: v for k, v in c.items() if k not in ("parallel", "ctx")} == {
-            k: v for k, v in t.items() if k not in ("parallel", "ctx")
-        }, name
-        instances = 1 if c.get("topology") == "split" else 2
-        assert c["parallel"] * instances == 4 and c["ctx"] >= 32768, name
-        assert t["ctx"] == 32768 and t["parallel"] * instances >= 4, name
+def test_kernel_state(monkeypatch, config):
+    outputs = {
+        "a": 'u/a has status "KernelWorkerStatus.RUNNING"',
+        "b": "Cannot access kernel 'u/b' (Permission 'kernels.get' was denied).",
+    }
+    monkeypatch.setattr(kaggle, "status", lambda config, slug: outputs[slug])
+    assert (kaggle.state(config, "a"), kaggle.state(config, "b")) == ("running", "-")

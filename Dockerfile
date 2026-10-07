@@ -11,7 +11,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY kis ./kis
 COPY kaggle ./kaggle
-COPY README.md config.example.toml config.throughput.example.toml ./
+COPY README.md ./
+COPY examples ./examples
 RUN uv sync --frozen --no-dev && mkdir -p /app/.kis && chown kis:kis /app/.kis
 
 # config.toml -> /app/config.toml, state -> /app/.kis, Kaggle token -> /home/kis/.kaggle
