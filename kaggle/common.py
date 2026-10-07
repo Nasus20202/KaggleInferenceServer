@@ -89,9 +89,10 @@ def llama_command(
     args: list[str],
 ) -> tuple[list[str], dict[str, str]]:
     """Command and environment of one llama-server instance on `gpus` with `parallel` slots
-    of `ctx` tokens each (KV pool = parallel x ctx): `args` for every model, then the preset's."""
+    of `ctx` tokens each (KV pool = parallel x ctx): `args` for every model, then the preset's.
+    No web UI: the balancer requires an API key on every route, which a browser doesn't send."""
     model_path, draft_path = paths
-    cmd = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port), "--alias", model.alias]
+    cmd = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port), "--alias", model.alias, "--no-webui"]
     cmd += ["--parallel", str(parallel), "--kv-unified-per-slot", str(ctx)]
     if draft_path:
         cmd += ["--model-draft", draft_path]
