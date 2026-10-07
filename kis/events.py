@@ -19,6 +19,7 @@ class Session:
     alive: bool = True
     endpoint: str | None = None
     started: float = 0.0  # unix time
+    preset: str = ""  # the loaded preset, as of the last ready or model_ready event
 
 
 def fetch(ntfy: Ntfy, topic: str, since: str) -> list[tuple[str, Event]]:
@@ -49,7 +50,9 @@ def sessions(events: list[Event]) -> dict[str, Session]:
     for event in events:
         s = out.get(event.session) or Session(event.session)
         if event.type == EventType.READY:
-            s = replace(s, endpoint=event.endpoint, started=event.at - event.t)
+            s = replace(s, endpoint=event.endpoint, started=event.at - event.t, preset=event.data.get("preset", ""))
+        elif event.type == EventType.MODEL_READY:
+            s = replace(s, preset=event.data.get("preset", s.preset))
         elif event.type in ENDED:
             s = replace(s, alive=False)
         out[event.session] = s

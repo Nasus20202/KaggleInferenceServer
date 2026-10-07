@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -63,9 +64,42 @@ def fake_llama_server(name: str, delay: float = 0.0) -> web.Application:
     async def models(_req: web.Request) -> web.Response:
         return web.json_response({"data": [{"id": name}]})
 
+    async def props(_req: web.Request) -> web.Response:
+        return web.json_response({"backend": name})
+
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_get("/v1/models", models)
+    app.router.add_get("/props", props)
     return app
+
+
+class FakeBackends:
+    """Stand-in for server.Backends: the ports of fake llama-servers per preset. Downloads
+    take `fetch_s`; loading a preset in `fail` raises."""
+
+    def __init__(self, ports: dict[str, list[int]], loaded: str, fetch_s: float = 0.0, fail: tuple[str, ...] = ()):
+        self.by_preset, self.loaded = ports, loaded
+        self.fetch_s, self.fail = fetch_s, fail
+        self.fetched: list[str] = [loaded]
+        self.loads: list[str] = []
+
+    @property
+    def ports(self) -> list[int]:
+        return self.by_preset[self.loaded]
+
+    def fetch(self, name: str) -> None:
+        time.sleep(self.fetch_s)
+        self.fetched.append(name)
+
+    def downloaded(self, name: str) -> bool:
+        return name in self.fetched
+
+    def load(self, name: str) -> list[int]:
+        self.loads.append(name)
+        if name in self.fail:
+            raise RuntimeError(f"cannot load {name}")
+        self.loaded = name
+        return self.ports
 
 
 @pytest.fixture
@@ -76,7 +110,7 @@ async def llama_servers(aiohttp_server):
 
 @pytest.fixture
 async def balancer(server, llama_servers):
-    return server.Balancer([s.port for s in llama_servers], api_key="secret")
+    return server.Balancer(FakeBackends({server.START: [s.port for s in llama_servers]}, server.START), "secret")
 
 
 @pytest.fixture(autouse=True)

@@ -43,3 +43,25 @@ def test_format_stats():
     assert "4 slots x 131072 tokens" in text
     assert "GPU0: 13.6 / 15.0 GiB VRAM, 87% busy" in text
     assert "m: 2 completions, tokens in 200 (cached 160, 80%), out 100; prefill 200.0 tok/s" in text
+
+
+def test_format_models_marks_the_loaded_preset():
+    models = [
+        {"id": "Qwen3.5-4B-Q4_K_M", "preset": "qwen35-4b", "status": "downloaded"},
+        {"id": "gemma-4-12B-it-qat-UD-Q4_K_XL", "preset": "gemma-4-12b", "status": "loaded"},
+    ]
+    assert status.format_models(models).splitlines() == [
+        "  qwen35-4b    Qwen3.5-4B-Q4_K_M  downloaded",
+        "* gemma-4-12b  gemma-4-12B-it-qat-UD-Q4_K_XL  loaded",
+    ]
+
+
+def test_format_models_shows_slots_and_context():
+    models = [
+        {"id": "A", "preset": "a", "status": "loaded", "context_length": 65536, "parallel": 4, "slots": 8},
+        {"id": "B", "preset": "b", "status": "available", "context_length": 32768, "parallel": 9, "slots": None},
+    ]
+    assert status.format_models(models).splitlines() == [
+        "* a  A  loaded  8 slots x 64K",
+        "  b  B  available  9 per instance x 32K",
+    ]

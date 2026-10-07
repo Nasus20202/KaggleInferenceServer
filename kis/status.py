@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from .schema import Stats
 
@@ -50,13 +51,28 @@ def format_quota(q: Quota | None, now: datetime | None = None) -> str:
     return line
 
 
+def format_models(models: list[dict[str, Any]]) -> str:
+    """One line per preset: name, alias, status, slots x context; the loaded one marked with *.
+    Slots are per instance (`parallel`) until a preset runs."""
+    width = max((len(m["preset"]) for m in models), default=0)
+    lines = []
+    for m in models:
+        mark = "*" if m.get("status") == "loaded" else " "
+        layout = ""
+        if ctx := m.get("context_length"):
+            slots = f"{m['slots']} slots" if m.get("slots") else f"{m.get('parallel')} per instance"
+            layout = f"  {slots} x {ctx // 1024}K"
+        lines.append(f"{mark} {m['preset']:<{width}}  {m['id']}  {m.get('status', '')}{layout}".rstrip())
+    return "\n".join(lines)
+
+
 def pct(x: float | None) -> str:
     return "-" if x is None else f"{x:.0%}"
 
 
 def format_stats(s: Stats) -> str:
     lines = [
-        f"model: {s.model}  {s.topology}, {s.slots} slots x {s.ctx} tokens",
+        f"model: {s.model}{f' ({s.preset})' if s.preset else ''}  {s.topology}, {s.slots} slots x {s.ctx} tokens",
         f"requests: {s.requests} ({s.errors} errors), {s.inflight} in flight, "
         f"up {s.uptime_s // 60} min, idle {s.idle_s // 60} min",
     ]

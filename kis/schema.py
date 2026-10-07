@@ -172,7 +172,11 @@ class ServerConfig:
     """Everything kaggle/server.py needs; `kis up` sends it as the CONFIG params."""
 
     api_key: str
-    model: Model
+    model: Model  # loaded first
+    preset: str = ""  # its preset name
+    models: dict[str, Model] = field(default_factory=dict)  # presets the session can swap to, `model` included
+    autoload: bool = True  # a request naming another preset swaps to it
+    prefetch: list[str] = field(default_factory=list)  # presets downloaded in the background after startup
     ntfy: Ntfy = field(default_factory=Ntfy)
     ntfy_topic: str = ""  # private control topic: events and the endpoint
     session: str = ""  # id in every event; `kis` tells sessions apart during a rollover
@@ -212,6 +216,9 @@ class EventType(enum.StrEnum):
     TUNNEL_RESTART = "tunnel_restart"
     STOPPED = "stopped"
     ERROR = "error"
+    MODEL_LOADING = "model_loading"  # swapping to another preset
+    MODEL_READY = "model_ready"
+    MODEL_FAILED = "model_failed"  # the session goes on with the previous preset
     # calibration runs
     CALIBRATING = "calibrating"
     CALIBRATED = "calibrated"
@@ -266,6 +273,17 @@ class Route(enum.StrEnum):
     STATS = "/admin/stats"  # GET: Stats as JSON
     LOGS = "/admin/logs"  # GET ?file=server.log&lines=200
     SHUTDOWN = "/admin/shutdown"  # POST ?session=<id>: 409 if that is another session
+    LOAD = "/admin/load"  # POST ?model=<preset or alias>: 202 while it loads, 200 if loaded
+    MODELS = "/v1/models"  # every preset of the session, with its status (also at /models)
+
+
+class ModelStatus(enum.StrEnum):
+    """A preset's state in /v1/models."""
+
+    LOADED = "loaded"
+    LOADING = "loading"
+    DOWNLOADED = "downloaded"  # on disk, loads without a download
+    AVAILABLE = "available"
 
 
 SERVER_LOG = "server.log"
@@ -301,7 +319,7 @@ class UsageSummary:
 @dataclass(frozen=True)
 class Stats:
     session: str
-    model: str
+    model: str  # alias of the loaded preset
     topology: Topology
     slots: int  # parallel x instances
     parallel: int  # slots per instance
@@ -313,6 +331,7 @@ class Stats:
     errors: int
     usage: dict[str, UsageSummary]  # per model name
     gpus: list[GpuStats]
+    preset: str = ""  # name of the loaded preset
 
 
 # --------------------------------------------------------------------------- calibration

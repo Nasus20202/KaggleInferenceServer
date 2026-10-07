@@ -66,7 +66,8 @@ uv run kis down                            # stops the session and saves GPU quo
 
 | Command | What it does |
 | --- | --- |
-| `kis up <model> [--parallel N] [--ctx N] [--topology split] [--no-spec]` | start a model (presets in `config.toml`) |
+| `kis up <model> [--parallel N] [--ctx N] [--topology split] [--no-spec]` | start a model (presets in `config.toml`); with a session up, swap to it |
+| `kis use [<model>]` | swap the running session to another preset; without one, list the presets and their status |
 | `kis proxy [--port P]` | local endpoint; follows the tunnel URL when it changes |
 | `kis status` | GPU quota left and reset time, kernel states, VRAM and load of the running server |
 | `kis bench` | throughput at each concurrency level |
@@ -79,6 +80,42 @@ uv run kis down                            # stops the session and saves GPU quo
 
 `parallel` is the number of slots per llama-server instance (2 replicas → 2× the slots) and `ctx` the context each slot is guaranteed. If they don't fit in VRAM, the server starts with fewer slots, never less context, and `backends_ready` shows what it got.
 
+## Switching models
+
+A session holds one model at a time and can swap to any preset in `config.toml`. `kis up <model>` picks the one it starts with. To switch, name another preset in a request's `model`, by preset name or alias:
+
+```bash
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "gemma-4-12b", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+or swap by hand with `kis use gemma-4-12b` (or `kis up gemma-4-12b` while a session runs). `kis use` alone lists the presets; `*` marks the loaded one:
+
+```
+$ kis use
+  qwen35-4b    Qwen3.5-4B-Q4_K_M  downloaded  9 per instance x 32K
+* gemma-4-12b  gemma-4-12B-it-qat-UD-Q4_K_XL  loaded  14 slots x 32K
+  qwen38-27b   Qwen3.8-27B-UD-Q4_K_M  available  4 per instance x 32K
+```
+
+What a swap does:
+1. **Download:** the new preset downloads while the loaded one keeps serving.
+2. **Drain:** requests in flight finish; new ones, for any preset, wait.
+3. **Load:** the llama-server instances are replaced, with the new preset's topology, slots and context.
+
+Waiting requests get keepalive bytes, so a swap longer than Cloudflare's 100 s limit doesn't cut them. If the new preset fails to load, they get the error and the previous preset is loaded again. Requests without `model`, or with a name that isn't a preset (`gpt-4o`), go to the loaded preset and never swap, so existing clients keep working.
+
+- **`/v1/models`** lists every preset by alias. Tools with a model picker show them all. Besides OpenAI's fields, each entry has:
+  - `preset` and `status`: `loaded`, `loading`, `downloaded` or `available`.
+  - `context_length`: the context each request gets (one slot's), under the name OpenRouter uses; not the model's trained context.
+  - `parallel` (slots per instance), `slots` (in total) and `topology`. The loaded preset shows what it runs with after any out-of-memory retries. The others show their configured values, with `slots` (and `topology`, unless the preset sets it) `null` until they run.
+- **`autoload = false`** in `[server]`: only `kis use` swaps; a request for another preset gets a 400 `model_not_loaded`.
+- **`prefetch = ["gemma-4-12b"]`** in `[server]`: download those presets in the background after startup, so swapping to them only loads them.
+- **Overrides:** `--parallel`, `--ctx`, `--topology` and `--no-spec` apply to the preset `kis up` starts with; the others keep their calibrated values. Each preset remembers the slots that fit after an out-of-memory retry, so loading it again is quicker.
+- **Rollover** starts the new session with the preset loaded at that point.
+
+Clients that alternate between presets make the session swap back and forth, and each swap costs a model load. Keep such clients on one preset, or set `autoload = false`. Downloaded files stay on the kernel's disk until the session ends.
+
 ## Monitoring and logs
 
 ```
@@ -86,7 +123,7 @@ $ kis status
 GPU quota: 28.3 h left of 30 h (1.7 h used), resets Sat 10 Oct 02:00 (in 2d 18h)
 kis-server: running
 endpoint: https://….trycloudflare.com/v1
-model: Qwen3.5-9B-Q4_K_M  replicas, 4 slots x 114688 tokens
+model: Qwen3.5-9B-Q4_K_M (qwen35-9b)  replicas, 4 slots x 114688 tokens
 requests: 12 (0 errors), 1 in flight, up 25 min, idle 0 min
 GPU0: 13.6 / 15.0 GiB VRAM, 87% busy
 GPU1: 13.6 / 15.0 GiB VRAM, 64% busy
@@ -101,6 +138,7 @@ Set `[notify] topic` in `config.toml` and subscribe to that topic in the [ntfy](
 - **Stopped:** the reason and how long the session ran.
 - **Failed:** the error.
 - **Out of memory:** each retry with fewer slots.
+- **Model swaps:** the new model once it is loaded, or why it failed to load.
 
 These messages never contain the endpoint or keys, so a guessable topic name is fine for them. `kis` uses its own private, random topic (in `.kis/secrets.json`) to find the server; never point that one at a public name, because anyone who can post to it could redirect `kis` to their own URL and receive your API key. `[notify] token` (or `KIS_NOTIFY_TOKEN`) is for access-protected topics.
 
@@ -122,7 +160,7 @@ The Kaggle kernel publishes there and `kis` reads from there, so the server must
 
 ```json
 {
-  "session": "3f9a1c2e", "model": "Qwen3.5-4B-Q4_K_M", "topology": "replicas", "slots": 4, "parallel": 2,
+  "session": "3f9a1c2e", "model": "Qwen3.5-4B-Q4_K_M", "preset": "qwen35-4b", "topology": "replicas", "slots": 4, "parallel": 2,
   "ctx": 131072,
   "uptime_s": 1500, "idle_s": 3, "inflight": 1, "requests": 12, "errors": 0,
   "usage": {"Qwen3.5-4B-Q4_K_M": {
@@ -137,7 +175,7 @@ In `usage`:
 - **Speeds:** `prefill_tps` and `decode_tps` are per-request speeds, weighted by time.
 - **Draft acceptance:** the share of MTP draft tokens accepted.
 
-`GET /admin/logs?file=server.log&lines=200` returns a log file (`kis logs --file`).
+`GET /admin/logs?file=server.log&lines=200` returns a log file (`kis logs --file`). `POST /admin/load?model=<preset>` starts a swap and answers 202 at once (`kis use` then follows the events).
 
 The places to look:
 - **Events:** start, ready, errors, and a stats heartbeat every 10 min. `kis logs` follows them.
@@ -219,7 +257,7 @@ Image: `ghcr.io/nasus20202/kaggleinferenceserver`.
 uv run pytest && uv run ruff format . && uv run ruff check . && uv run pyright
 ```
 
-The code is fully typed and pyright checks it in standard mode. Settings, events, stats and calibration results are dataclasses in `kis/schema.py`, shared by `kis` and the Kaggle scripts. `kis` sends them to a kernel as plain data, and the kernel reads them back with `schema.load`, which checks every key and type. A typo in `config.toml` therefore fails at once with its path, e.g. `config.server: unknown key(s) idle_minuts`. Fixed sets of values are enums: `Topology`, `TunnelKind`, `EventType`, `Route`.
+The code is fully typed and pyright checks it in standard mode. Settings, events, stats and calibration results are dataclasses in `kis/schema.py`, shared by `kis` and the Kaggle scripts. `kis` sends them to a kernel as plain data, and the kernel reads them back with `schema.load`, which checks every key and type. A typo in `config.toml` therefore fails at once with its path, e.g. `config.server: unknown key(s) idle_minuts`. Fixed sets of values are enums: `Topology`, `TunnelKind`, `EventType`, `Route`, `ModelStatus`.
 
 CI runs these checks, then builds the image and publishes it to GHCR from `main`. Renovate automerges minor and patch updates and checks weekly for new llama.cpp releases. CI doesn't build llama.cpp, so after a llama.cpp update, run `kis build` again.
 
