@@ -15,7 +15,8 @@ whole session beside the swapped one: requests naming them go to their instance 
 never swap.
 
 Started by `kis up <model>`, which fills in CONFIG. Status events, the endpoint
-URL and a periodic stats heartbeat go to a private ntfy topic; everything is
+URL, a periodic stats heartbeat and the final stats (with `stopped`) go to a
+private ntfy topic; everything is
 also logged with timestamps to the kernel log and /kaggle/working/server.log
 (one line per request). Authenticated routes: GET /admin/stats (GPU memory and
 load, slots, requests), GET /admin/logs?file=...&lines=N, POST /admin/shutdown.
@@ -417,7 +418,7 @@ HOP_HEADERS = {
 }
 
 
-CAPTURE_BYTES = 256 << 10  # tail of each response kept to read its usage and timings
+CAPTURE_HEAD, CAPTURE_TAIL = 16 << 10, 256 << 10  # start and end of each response kept to read its usage
 
 
 @dataclass
@@ -458,8 +459,10 @@ def parse_usage(body: bytes, sse: bool) -> Completion | None:
             if len(docs) >= 3:
                 break
     else:
-        with contextlib.suppress(ValueError):
+        try:
             docs.append(json.loads(body))
+        except ValueError:  # too large to keep whole, e.g. a batch of embeddings
+            docs.append(kept_fields(body))
     dicts = [d for d in docs if isinstance(d, dict)]
     usage = next((d["usage"] for d in dicts if d.get("usage")), None)
     timings = next((d["timings"] for d in dicts if d.get("timings")), None)
@@ -478,6 +481,19 @@ def parse_usage(body: bytes, sse: bool) -> Completion | None:
         draft_n=timings.get("draft_n", 0),
         draft_accepted=timings.get("draft_n_accepted", 0),
     )
+
+
+USAGE_KEY = re.compile(r'"(model|usage|timings)"\s*:\s*')
+
+
+def kept_fields(body: bytes) -> dict[str, Any]:
+    """`model`, `usage` and `timings` from the start and end kept of a JSON response whose
+    middle was dropped: llama-server writes them before or after the large fields."""
+    text, decoder, fields = body.decode(errors="replace"), json.JSONDecoder(), {}
+    for match in USAGE_KEY.finditer(text):
+        with contextlib.suppress(ValueError):
+            fields.setdefault(match.group(1), decoder.raw_decode(text, match.end())[0])
+    return fields
 
 
 class Usage:
@@ -907,7 +923,8 @@ class Balancer:
             async for chunk in upstream.content.iter_any():
                 await resp.write(chunk)
                 captured += chunk
-                del captured[:-CAPTURE_BYTES]
+                if len(captured) > CAPTURE_HEAD + CAPTURE_TAIL:
+                    del captured[CAPTURE_HEAD:-CAPTURE_TAIL]
             await resp.write_eof()
         except ConnectionResetError:  # client went away; closing upstream stops generation
             pass
@@ -1000,8 +1017,8 @@ TUNNELS = {TunnelKind.CLOUDFLARED: cloudflared, TunnelKind.TAILSCALE: tailscale}
 # --------------------------------------------------------------------------- main
 
 
-async def serve(backends: Backends) -> str:
-    """Run the balancer and tunnel until shutdown; return the stop reason."""
+async def serve(backends: Backends) -> tuple[str, Stats]:
+    """Run the balancer and tunnel until shutdown; return the stop reason and the final stats."""
     balancer = Balancer(backends, SETTINGS.api_key, residents=backends.residents)
     await balancer.start()
     tunnel = SETTINGS.tunnel
@@ -1028,8 +1045,9 @@ async def serve(backends: Backends) -> str:
         else:
             continue
         break
+    stats = await balancer.stats()
     await balancer.close()
-    return balancer.failure or reason
+    return balancer.failure or reason, stats
 
 
 def main() -> None:
@@ -1046,10 +1064,10 @@ def main() -> None:
         backends.close()
         sys.exit(1)
     try:
-        reason = asyncio.run(serve(backends))
+        reason, stats = asyncio.run(serve(backends))
     finally:
         backends.close()
-    notify(EventType.STOPPED, reason=reason)
+    notify(EventType.STOPPED, reason=reason, **dump(stats))
 
 
 if __name__ == "__main__":

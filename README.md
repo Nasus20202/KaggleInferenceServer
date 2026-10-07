@@ -179,7 +179,7 @@ In `usage`:
 `GET /admin/logs?file=server.log&lines=200` returns a log file (`kis logs --file`). `POST /admin/load?model=<preset>` starts a swap and answers 202 at once (`kis use` then follows the events).
 
 The places to look:
-- **Events:** start, ready, errors, and a stats heartbeat every 10 min. `kis logs` follows them.
+- **Events:** start, ready, errors, a stats heartbeat every 10 min, and the final stats with `stopped`. `kis logs` follows them.
 - **Server log:** timestamped, one line per request: backend, status, duration, tokens in/cached/out, prefill and decode speed, draft acceptance. `kis logs --file server.log` prints it; it's also in the Kaggle kernel log.
 - **llama-server output:** `kis logs --file llama-8090.log` (`llama-8091.log` for the second replica).
 - **Local:** `kis proxy` logs each request and endpoint changes. `-v` or `KIS_LOG_LEVEL=DEBUG` adds more detail.

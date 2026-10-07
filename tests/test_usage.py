@@ -2,8 +2,12 @@
 
 import json
 
-from kis.schema import EventType, Notify, Ntfy
+from aiohttp import web
+from conftest import FakeBackends
 
+from kis.schema import EventType, Model, Notify, Ntfy
+
+AUTH = {"Authorization": "Bearer secret"}
 USAGE = {"prompt_tokens": 100, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 80}}
 TIMINGS = {
     "prompt_n": 20,
@@ -70,3 +74,31 @@ def test_notifications_are_readable_and_never_leak_the_endpoint(server, monkeypa
     assert [topic for _, topic, _, _ in sent] == ["kis-private"]
     server.notify(EventType.ERROR, error="CUDA out of memory")
     assert sent[-1][3]["Priority"] == "high"
+
+
+async def test_usage_of_responses_too_large_to_keep_whole(server, aiohttp_server, aiohttp_client):
+    """Batches of embeddings: llama-server may write `usage` before or after the vectors."""
+    vectors = [{"index": i, "embedding": [0.123456] * 768} for i in range(64)]  # ~600 KB of JSON
+    orders = {
+        "first": {"model": "E", "usage": {"prompt_tokens": 7}, "data": vectors},
+        "last": {"data": vectors, "model": "E", "usage": {"prompt_tokens": 9}},
+    }
+
+    async def embeddings(req):
+        return web.json_response(orders[(await req.json())["input"]])
+
+    app = web.Application()
+    app.router.add_post("/v1/embeddings", embeddings)
+    embedder = await aiohttp_server(app)
+    presets = {
+        "a": Model(repo="r", file="a.gguf", alias="A", parallel=1),
+        "e": Model(repo="r", file="e.gguf", alias="E", parallel=1),
+    }
+    backends = FakeBackends({"a": []}, "a")
+    balancer = server.Balancer(backends, "secret", presets=presets, loaded="a", residents={"e": embedder.port})
+    client = await aiohttp_client(balancer.app())
+    for order in orders:
+        resp = await client.post("/v1/embeddings", json={"model": "e", "input": order}, headers=AUTH)
+        assert len((await resp.json())["data"]) == 64
+    summary = balancer.usage["E"].summary()
+    assert (summary.requests, summary.tokens_in) == (2, 16)
