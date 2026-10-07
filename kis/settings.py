@@ -6,6 +6,9 @@ import os
 import secrets
 import sys
 import tomllib
+import types
+import typing
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ from .schema import Calibration, Model, Notify, Ntfy, SchemaError, ServerConfig,
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / ".kis"
+ENV_PREFIX = "KIS_"
 
 
 @dataclass(frozen=True)
@@ -68,20 +72,49 @@ class State:
     calibration: dict[str, Calibration] = field(default_factory=dict)  # per preset name
 
 
-def parse_config(data: dict[str, Any], environ: dict[str, str] | None = None) -> Config:
-    """Config from parsed TOML; KIS_NTFY_TOKEN and KIS_NOTIFY_TOKEN override the tokens."""
-    config = load(Config, data, "config")
-    env = os.environ if environ is None else environ
-    if token := env.get("KIS_NTFY_TOKEN"):
-        config.ntfy = dataclasses.replace(config.ntfy, token=token)
-    if token := env.get("KIS_NOTIFY_TOKEN"):
-        config.notify = dataclasses.replace(config.notify, token=token)
-    return config
+def with_env(cls: type, data: dict[str, Any], environ: Mapping[str, str], prefix: str = ENV_PREFIX) -> dict[str, Any]:
+    """`data` (parsed TOML or JSON of dataclass `cls`) with the values set in the environment
+    as KIS_ and the field's path in upper case, e.g. KIS_SERVER_ROLLOVER_HOURS for
+    [server] rollover_hours. Strings are taken as they are, other values are read as TOML
+    (2.5, true, ["--metrics"]). Presets ([models.*]) can't be set: their names may not be
+    valid variable names."""
+    data = dict(data)
+    hints = typing.get_type_hints(cls)
+    for f in dataclasses.fields(cls):
+        name, hint = prefix + f.name.upper(), hints[f.name]
+        if dataclasses.is_dataclass(hint):
+            if table := with_env(hint, data.get(f.name, {}), environ, name + "_"):  # type: ignore[arg-type]
+                data[f.name] = table
+        elif name in environ and typing.get_origin(hint) is not dict:
+            data[f.name] = environ[name] if _is_text(hint) else _toml_value(name, environ[name])
+    return data
 
 
-def load_config() -> Config:
-    """config.toml, or the file named by KIS_CONFIG."""
+def _is_text(hint: Any) -> bool:
+    """str, a str enum, or an optional one."""
+    if typing.get_origin(hint) in (typing.Union, types.UnionType):
+        return any(_is_text(a) for a in typing.get_args(hint))
+    return isinstance(hint, type) and issubclass(hint, str)
+
+
+def _toml_value(name: str, value: str) -> Any:
+    try:
+        return tomllib.loads(f"v = {value}")["v"]
+    except tomllib.TOMLDecodeError as e:
+        raise SchemaError(f"{name}: {value!r} is not a TOML value ({e})") from None
+
+
+def parse_config(data: dict[str, Any], environ: Mapping[str, str] | None = None) -> Config:
+    """Config from parsed TOML, with the values set in the environment (see with_env)."""
+    return load(Config, with_env(Config, data, os.environ if environ is None else environ), "config")
+
+
+def load_config(required: bool = True) -> Config:
+    """config.toml, or the file named by KIS_CONFIG. Without one, unless `required`, the
+    defaults and the environment: enough for `kis proxy`, which only follows the ntfy topic."""
     path = Path(os.environ.get("KIS_CONFIG") or ROOT / "config.toml")
+    if not path.exists() and not required:
+        return parse_config({"kaggle": {"username": "", "llama_cpp_ref": ""}, "models": {}})
     if not path.exists():
         sys.exit(f"{path} missing: cp examples/config.32k.toml config.toml and set kaggle.username")
     try:
@@ -106,12 +139,13 @@ def _write(name: str, data: object) -> None:
 
 
 def load_secrets() -> Secrets:
-    """API key and private ntfy topic, generated on first use."""
+    """API key and private ntfy topic from .kis/secrets.json and the environment (KIS_API_KEY,
+    KIS_NTFY_TOPIC). The file is generated on first use, unless the environment sets both."""
     data = _read("secrets.json")
-    if not data:
+    if not data and len(with_env(Secrets, {}, os.environ)) < len(dataclasses.fields(Secrets)):
         data = {"api_key": "sk-kis-" + secrets.token_urlsafe(24), "ntfy_topic": "kis-" + secrets.token_hex(12)}
         _write("secrets.json", data)
-    return load(Secrets, data, ".kis/secrets.json")
+    return load(Secrets, with_env(Secrets, data, os.environ), ".kis/secrets.json")
 
 
 def load_state() -> State:

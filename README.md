@@ -252,6 +252,8 @@ docker compose up -d     # proxy on 127.0.0.1:8080
 
 Image: `ghcr.io/nasus20202/kaggleinferenceserver`.
 
+Every setting can also come from the environment, as `KIS_` and its path in upper case: `KIS_SERVER_ROLLOVER_HOURS=0` for `[server] rollover_hours`, `KIS_API_KEY` and `KIS_NTFY_TOPIC` for `.kis/secrets.json`. Strings are taken as they are, other values are read as TOML (`KIS_SERVER_ARGS='["--metrics"]'`); presets (`[models.*]`) only come from the file. In CI, pass the secrets that way instead of mounting `.kis`, and the config file with `KIS_CONFIG`. `kis proxy` needs no config file: it only follows the ntfy topic to the current session, so it runs as a service container with just the two secrets.
+
 ## Development
 
 ```bash

@@ -394,6 +394,6 @@ def main() -> None:
     logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)  # the proxy logs its own request lines
     try:
-        globals()[f"cmd_{args.cmd}"](args, load_config())
+        globals()[f"cmd_{args.cmd}"](args, load_config(required=args.cmd != "proxy"))
     except (kaggle.KaggleError, rollover.RolloverError) as e:
         sys.exit(str(e))
