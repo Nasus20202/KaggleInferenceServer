@@ -27,7 +27,9 @@ def kernel_url(config: dict, slug: str) -> str:
 
 
 def render(script: str, params: dict) -> str:
-    """kaggle/<script> with the block between `# <params>` and `# </params>` replaced by `params`."""
+    """kaggle/<script> with the block between `# <params>` and `# </params>` replaced by
+    `params`, and its `from common import ...` line replaced by kaggle/common.py (Kaggle
+    runs a single file)."""
     source = (ROOT / "kaggle" / script).read_text()
     block = "".join(
         f"{name} = {pprint.pformat(value, sort_dicts=False, width=110)}\n" for name, value in params.items()
@@ -36,6 +38,10 @@ def render(script: str, params: dict) -> str:
         r"(# <params>.*?\n).*?(# </params>)", lambda m: m.group(1) + block + m.group(2), source, count=1, flags=re.S
     )
     assert n == 1, f"no params block in {script}"
+    common = (ROOT / "kaggle" / "common.py").read_text()
+    rendered = re.sub(
+        r"^from common import .*$", lambda _: f"# --- kaggle/common.py\n{common}# ---", rendered, flags=re.M
+    )
     return rendered
 
 

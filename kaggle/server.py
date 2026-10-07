@@ -15,12 +15,10 @@ on /admin/shutdown.
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -30,8 +28,9 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from common import fetch, gpu_stats, llama_command, llama_server_binary, publish  # inlined by `kis`
 
-# <params> (replaced by `kis up`; edit by hand to run the script in the Kaggle UI)
+# <params> (replaced by `kis up`; to run by hand in the Kaggle UI, edit the rendered .kis/kis-server/server.py)
 CONFIG = {
     "api_key": "change-me",
     "ntfy_topic": "",
@@ -55,7 +54,6 @@ CONFIG = {
 
 MODEL = CONFIG["model"]
 WORK = Path("/kaggle/working")
-MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
 PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
@@ -75,13 +73,12 @@ def setup_logging():
 
 def notify(event: str, **data):
     """Log a status event and publish it to the ntfy topic that `kis` follows."""
-    msg = json.dumps({"event": event, "t": round(time.time() - STARTED), "session": CONFIG["session"], **data})
-    log.info("event %s", msg)
-    if CONFIG["ntfy_topic"]:
-        try:
-            urllib.request.urlopen(f"https://ntfy.sh/{CONFIG['ntfy_topic']}", data=msg.encode(), timeout=10)
-        except OSError as e:
-            log.warning("ntfy failed: %s", e)
+    payload = {"event": event, "t": round(time.time() - STARTED), "session": CONFIG["session"], **data}
+    log.info("event %s", json.dumps(payload))
+    try:
+        publish(CONFIG["ntfy_topic"], payload)
+    except OSError as e:
+        log.warning("ntfy failed: %s", e)
 
 
 def log_file(name: str):
@@ -96,34 +93,6 @@ def download(url: str, path: str) -> str:
     return path
 
 
-# --------------------------------------------------------------------------- model
-
-
-def llama_server_binary() -> str:
-    """Copy llama-server from the attached build output (inputs are read-only)."""
-    found = sorted(Path("/kaggle/input").rglob("llama-server"))
-    if not found:
-        raise RuntimeError("llama-server not found: attach the build kernel output (`kis build`)")
-    shutil.copy(found[0], "/tmp/llama-server")
-    os.chmod("/tmp/llama-server", 0o755)
-    return "/tmp/llama-server"
-
-
-def fetch(file: str, sha256: str | None) -> str:
-    from huggingface_hub import hf_hub_download
-
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    path = hf_hub_download(MODEL["repo"], file, revision=MODEL.get("revision"), local_dir=MODELS_DIR)
-    if sha256:
-        digest = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 24), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != sha256:
-            raise RuntimeError(f"sha256 mismatch for {file}")
-    return path
-
-
 # --------------------------------------------------------------------------- llama-server instances
 
 
@@ -131,27 +100,7 @@ def launch(
     binary: str, model_path: str, draft_path: str | None, port: int, gpu_ids: list[str], parallel: int, ctx: int
 ) -> subprocess.Popen:
     """One llama-server with `parallel` slots of `ctx` tokens each (KV pool = parallel x ctx)."""
-    cmd = [
-        binary,
-        "-m",
-        model_path,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--alias",
-        MODEL["alias"],
-        "--parallel",
-        str(parallel),
-        "--kv-unified-per-slot",
-        str(ctx),
-    ]
-    if draft_path:
-        cmd += ["--model-draft", draft_path]
-    if len(gpu_ids) > 1:
-        cmd += ["--split-mode", "layer", "--tensor-split", MODEL.get("tensor_split") or ",".join("1" * len(gpu_ids))]
-    cmd += CONFIG["args"] + MODEL.get("args", [])
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(gpu_ids)}
+    cmd, env = llama_command(binary, MODEL, (model_path, draft_path), port, gpu_ids, parallel, ctx, CONFIG["args"])
     return subprocess.Popen(cmd, env=env, stdout=log_file(f"llama-{port}.log"), stderr=subprocess.STDOUT)
 
 
@@ -173,25 +122,6 @@ def plan(gpus: list[str], size_gb: float, topology: str | None, replica_max_gb: 
 
 
 OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
-
-
-def gpu_stats() -> list[dict]:
-    """Memory (MiB) and utilization (%) of each GPU; empty if nvidia-smi fails."""
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("nvidia-smi failed: %s", e)
-        return []
-    keys = ("gpu", "used_mib", "total_mib", "util_pct")
-    return [dict(zip(keys, map(int, line.split(", ")), strict=True)) for line in out.strip().splitlines()]
 
 
 def start_backends(model_path: str, draft_path: str | None) -> dict[int, subprocess.Popen]:
@@ -570,8 +500,8 @@ async def serve(backends: dict[int, subprocess.Popen]) -> str:
 def main():
     setup_logging()
     notify("starting", model=MODEL["alias"])
-    model_path = fetch(MODEL["file"], MODEL.get("sha256"))
-    draft_path = fetch(MODEL["draft_file"], MODEL.get("draft_sha256")) if MODEL.get("draft_file") else None
+    model_path = fetch(MODEL, MODEL["file"], MODEL.get("sha256"))
+    draft_path = fetch(MODEL, MODEL["draft_file"], MODEL.get("draft_sha256")) if MODEL.get("draft_file") else None
     notify("downloaded")
     backends = start_backends(model_path, draft_path)
     try:

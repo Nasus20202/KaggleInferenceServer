@@ -15,13 +15,14 @@ import bisect
 import contextlib
 import json
 import os
-import shutil
 import subprocess
 import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from common import fetch, gpu_stats, llama_command, llama_server_binary, publish  # inlined by `kis`
 
 # <params> (replaced by `kis calibrate`)
 RUN = ""
@@ -36,36 +37,22 @@ CTX_STEP = 16384  # granularity of the "max" profile
 MAX_PARALLEL = 32
 MARGIN_MIB = 512
 BENCH_TOKENS = 256
-MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
 LOGS = Path("/kaggle/working")
 STARTED = time.time()
 
 
 def notify(event: str, **data):
-    msg = json.dumps({"event": event, "t": round(time.time() - STARTED), "run": RUN, **data})
-    print(msg, flush=True)
-    if NTFY_TOPIC:
-        try:
-            urllib.request.urlopen(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg.encode(), timeout=10)
-        except OSError as e:
-            print("ntfy failed:", e, flush=True)
-
-
-def llama_server_binary() -> str:
-    found = sorted(Path("/kaggle/input").rglob("llama-server"))
-    if not found:
-        raise RuntimeError("llama-server not found: attach the build kernel output (`kis build`)")
-    shutil.copy(found[0], "/tmp/llama-server")
-    os.chmod("/tmp/llama-server", 0o755)
-    return "/tmp/llama-server"
+    payload = {"event": event, "t": round(time.time() - STARTED), "run": RUN, **data}
+    print(json.dumps(payload), flush=True)
+    try:
+        publish(NTFY_TOPIC, payload)
+    except OSError as e:
+        print("ntfy failed:", e, flush=True)
 
 
 def gpu_used_mib(gpus: list[str]) -> dict[str, tuple[int, int]]:
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"], text=True
-    )
-    rows = {i: (int(u), int(t)) for i, u, t in (line.split(", ") for line in out.strip().splitlines())}
-    return {g: rows[g] for g in gpus}
+    """(used, total) MiB of the given GPUs."""
+    return {str(g["gpu"]): (g["used_mib"], g["total_mib"]) for g in gpu_stats() if str(g["gpu"]) in gpus}
 
 
 def largest(values: list[int], fits, guess: int) -> tuple[int, dict] | None:
@@ -97,20 +84,13 @@ class Tester:
     @contextlib.contextmanager
     def running(self, parallel: int, ctx: int):
         """Yield the VRAM use if llama-server starts, serves a request and leaves MARGIN_MIB free, else None."""
-        model_path, draft_path = self.paths
-        cmd = [self.binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(self.port)]
-        cmd += ["--parallel", str(parallel), "--kv-unified-per-slot", str(ctx)]
-        if draft_path:
-            cmd += ["--model-draft", draft_path]
-        if len(self.gpus) > 1:
-            split = self.model.get("tensor_split") or ",".join("1" * len(self.gpus))
-            cmd += ["--split-mode", "layer", "--tensor-split", split]
-        cmd += ARGS + self.model.get("args", [])
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(self.gpus)}
+        cmd, env = llama_command(self.binary, self.model, self.paths, self.port, self.gpus, parallel, ctx, ARGS)
         with open(LOGS / f"calibrate-{self.port}.log", "w") as log:
             proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
             used = gpu_used_mib(self.gpus) if self._serves(proc) else None
+            if used is not None and len(used) < len(self.gpus):
+                used = None  # nvidia-smi failed: can't tell whether it fits
             fits = bool(used) and all(total - u >= MARGIN_MIB for u, total in used.values())
             print(f"  gpus={','.join(self.gpus)} parallel={parallel} ctx={ctx}: {fits} {used}", flush=True)
             yield {"used_mib": {g: u for g, (u, _) in used.items()}} if fits else None
@@ -183,13 +163,6 @@ class Tester:
             with ThreadPoolExecutor(parallel) as pool:
                 tokens = sum(pool.map(lambda _: self.complete(BENCH_TOKENS, ignore_eos=True), range(parallel)))
             return {"single_tps": round(single, 1), "total_tps": round(tokens / (time.time() - start), 1)}
-
-
-def fetch(model: dict, file: str) -> str:
-    from huggingface_hub import hf_hub_download
-
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    return hf_hub_download(model["repo"], file, revision=model.get("revision"), local_dir=MODELS_DIR)
 
 
 def in_parallel(*jobs):

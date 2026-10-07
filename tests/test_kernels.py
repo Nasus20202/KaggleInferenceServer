@@ -2,6 +2,8 @@
 
 import argparse
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -86,3 +88,19 @@ def test_kernel_state(monkeypatch, config):
     }
     monkeypatch.setattr(kaggle, "status", lambda config, slug: outputs[slug])
     assert (kaggle.state(config, "a"), kaggle.state(config, "b")) == ("running", "-")
+
+
+@pytest.mark.parametrize(
+    ("script", "params"),
+    [("server.py", lambda config: cli.server_params(up_args(), config, SECRETS)), ("calibrate.py", lambda config: {})],
+)
+def test_rendered_scripts_are_self_contained(script, params, config, tmp_path):
+    """Kaggle runs one file: kaggle/common.py must be inlined, and the result must import
+    without the repository on sys.path."""
+    source = kaggle.render(script, params(config))
+    assert "from common import" not in source and "def llama_command(" in source
+    path = tmp_path / script
+    path.write_text(source)
+    probe = f"import runpy; runpy.run_path({str(path)!r}, run_name='probe')"
+    result = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

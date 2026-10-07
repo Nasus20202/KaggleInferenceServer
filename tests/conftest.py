@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import sys
 import tomllib
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from aiohttp import web
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "kaggle"))  # the Kaggle scripts import kaggle/common.py (inlined when pushed)
 
 
 @pytest.fixture(scope="session")
