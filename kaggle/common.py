@@ -18,12 +18,20 @@ from pathlib import Path
 from kis.schema import Event, GpuStats, Model, Ntfy
 
 MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
+NTFY_MESSAGE_BYTES = 4096  # ntfy.sh's limit; a longer message becomes an attachment, which kis can't read
+
+
+def event_message(event: Event) -> str:
+    """An event as JSON, indented for reading in the ntfy app, or compact if that is too long."""
+    data = event.to_json()
+    pretty = json.dumps(data, indent=2)
+    return pretty if len(pretty.encode()) <= NTFY_MESSAGE_BYTES else json.dumps(data)
 
 
 def publish(ntfy: Ntfy, topic: str, payload: Event | str, headers: dict[str, str] | None = None) -> str:
     """Send one message (an event as JSON, or text with ntfy headers like Title) to a topic
     on the ntfy server, if the topic is set; return it. Raises OSError on failure."""
-    msg = payload if isinstance(payload, str) else json.dumps(payload.to_json())
+    msg = payload if isinstance(payload, str) else event_message(payload)
     if topic:
         req = urllib.request.Request(ntfy.url(topic), data=msg.encode(), headers={**ntfy.headers(), **(headers or {})})
         urllib.request.urlopen(req, timeout=10)

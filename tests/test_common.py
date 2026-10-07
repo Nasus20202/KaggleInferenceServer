@@ -42,3 +42,10 @@ def test_publish_to_a_self_hosted_server_with_a_token(monkeypatch):
     assert json.loads(req.data) == {"event": "ready", "t": 3, "session": "s"}
     common.publish(ntfy, "", "no topic: not sent")
     assert len(sent) == 1
+
+
+def test_events_are_indented_unless_too_long_for_ntfy():
+    short = common.event_message(Event(EventType.READY, t=3, session="s"))
+    assert "\n  " in short and json.loads(short)["event"] == "ready"
+    long = common.event_message(Event(EventType.ERROR, data={"log": "x" * common.NTFY_MESSAGE_BYTES}))
+    assert "\n" not in long and json.loads(long)["log"].startswith("x")
