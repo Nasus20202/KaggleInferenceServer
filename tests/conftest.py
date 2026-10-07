@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 
+from kis.settings import Config, Secrets, parse_config
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "kaggle"))  # the Kaggle scripts import kaggle/common.py (inlined when pushed)
 
@@ -23,10 +25,13 @@ def server():
 
 
 @pytest.fixture
-def config():
+def config() -> Config:
     data = tomllib.loads((ROOT / "examples" / "config.32k.toml").read_text())
     data["kaggle"]["username"] = "tester"
-    return data
+    return parse_config(data, environ={})
+
+
+SECRETS = Secrets(api_key="secret", ntfy_topic="test")
 
 
 def fake_llama_server(name: str, delay: float = 0.0) -> web.Application:

@@ -17,7 +17,7 @@ LLAMA_CPP_REF = "v0.6.0"
 SRC, OUT = "/tmp/llama.cpp", "/kaggle/working/bin"
 
 
-def sh(cmd: str):
+def sh(cmd: str) -> None:
     print("+", cmd, flush=True)
     subprocess.run(cmd, shell=True, check=True)
 

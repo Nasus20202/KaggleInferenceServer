@@ -3,16 +3,21 @@
 import tomllib
 
 from kis import profiles
+from kis.schema import Calibration, Fit, Topology
 
 
-def fit(parallel: int, ctx: int, topology: str = "replicas") -> dict:
-    instances = 2 if topology == "replicas" else 1
-    return {"parallel": parallel, "ctx": ctx, "topology": topology, "instances": instances, "single_tps": 50.0}
+def fit(parallel: int, ctx: int, topology: Topology = Topology.REPLICAS) -> Fit:
+    instances = 2 if topology == Topology.REPLICAS else 1
+    return Fit(topology=topology, instances=instances, parallel=parallel, ctx=ctx, single_tps=50.0)
+
+
+def calibration(model: str, **profiles: Fit) -> Calibration:
+    return Calibration(model=model, model_gb=1.0, n_ctx_train=262144, profiles=profiles)
 
 
 RESULTS = {
-    "qwen35-4b": {"profiles": {"128k": fit(2, 131072), "max": fit(1, 262144, "split")}},
-    "qwen38-27b": {"profiles": {"max": fit(1, 196608, "split")}},
+    "qwen35-4b": calibration("qwen35-4b", **{"128k": fit(2, 131072), "max": fit(1, 262144, Topology.SPLIT)}),
+    "qwen38-27b": calibration("qwen38-27b", max=fit(1, 196608, Topology.SPLIT)),
 }
 
 

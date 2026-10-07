@@ -1,10 +1,11 @@
 """Local proxy (kis/proxy.py) chained to the Kaggle-side balancer and fake llama-servers."""
 
+import dataclasses
+
 import pytest
+from conftest import SECRETS
 
 from kis import events, proxy
-
-SECRETS = {"api_key": "secret", "ntfy_topic": "test"}
 
 
 @pytest.fixture
@@ -14,8 +15,12 @@ async def balancer_url(aiohttp_server, balancer):
 
 
 async def make_client(aiohttp_client, monkeypatch, config, url):
+    return await make_client_with(aiohttp_client, monkeypatch, config, url, SECRETS)
+
+
+async def make_client_with(aiohttp_client, monkeypatch, config, url, secrets):
     monkeypatch.setattr(events, "endpoint", lambda config, topic: url)
-    return await aiohttp_client(proxy.make_app(config, SECRETS))
+    return await aiohttp_client(proxy.make_app(config, secrets))
 
 
 async def test_adds_api_key(aiohttp_client, monkeypatch, config, balancer_url):
@@ -91,8 +96,8 @@ async def test_retries_transient_upstream_errors(aiohttp_client, aiohttp_server,
 
 
 async def test_does_not_retry_client_errors(aiohttp_client, monkeypatch, config, balancer_url):
-    monkeypatch.setitem(SECRETS, "api_key", "wrong")
-    client = await make_client(aiohttp_client, monkeypatch, config, balancer_url)
+    wrong = dataclasses.replace(SECRETS, api_key="wrong")
+    client = await make_client_with(aiohttp_client, monkeypatch, config, balancer_url, wrong)
     assert (await client.get("/v1/models")).status == 401
 
 

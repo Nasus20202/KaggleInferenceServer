@@ -104,13 +104,26 @@ Set `[notify] topic` in `config.toml` and subscribe to that topic in the [ntfy](
 
 These messages never contain the endpoint or keys, so a guessable topic name is fine for them. `kis` uses its own private, random topic (in `.kis/secrets.json`) to find the server; never point that one at a public name, because anyone who can post to it could redirect `kis` to their own URL and receive your API key. `[notify] token` (or `KIS_NOTIFY_TOKEN`) is for access-protected topics.
 
+### Self-hosted ntfy
+
+`kis` uses [ntfy.sh](https://ntfy.sh) by default. To use your own ntfy server instead, set `[ntfy]`:
+
+```toml
+[ntfy]
+server = "https://ntfy.example.com"
+token = ""   # or KIS_NTFY_TOKEN; for servers that require login (tk_... access token)
+```
+
+The Kaggle kernel publishes there and `kis` reads from there, so the server must be reachable from both. Notifications go to the same server with the same token, unless `[notify] server` (and `[notify] token`) name another one. With `auth-default-access: deny-all`, give the token's user read-write access to the control topic (`kis-*`) and the `kis-*-calibrate` topic.
+
 ### Stats API
 
 `GET /admin/stats` on the Kaggle server returns the same data as JSON. It needs the server's API key (`kis env` prints it). Through `kis proxy`, `curl localhost:8080/admin/stats` works without it (with `KIS_PROXY_API_KEY` if you set one):
 
 ```json
 {
-  "model": "Qwen3.5-4B-Q4_K_M", "topology": "replicas", "slots": 4, "parallel": 2, "ctx": 131072,
+  "session": "3f9a1c2e", "model": "Qwen3.5-4B-Q4_K_M", "topology": "replicas", "slots": 4, "parallel": 2,
+  "ctx": 131072,
   "uptime_s": 1500, "idle_s": 3, "inflight": 1, "requests": 12, "errors": 0,
   "usage": {"Qwen3.5-4B-Q4_K_M": {
     "requests": 11, "tokens_in": 52310, "tokens_out": 8120, "tokens_cached": 41870, "cache_rate": 0.8,
@@ -203,8 +216,10 @@ Image: `ghcr.io/nasus20202/kaggleinferenceserver`.
 ## Development
 
 ```bash
-uv run pytest && uv run ruff format . && uv run ruff check .
+uv run pytest && uv run ruff format . && uv run ruff check . && uv run pyright
 ```
+
+The code is fully typed and pyright checks it in standard mode. Settings, events, stats and calibration results are dataclasses in `kis/schema.py`, shared by `kis` and the Kaggle scripts. `kis` sends them to a kernel as plain data, and the kernel reads them back with `schema.load`, which checks every key and type. A typo in `config.toml` therefore fails at once with its path, e.g. `config.server: unknown key(s) idle_minuts`. Fixed sets of values are enums: `Topology`, `TunnelKind`, `EventType`, `Route`.
 
 CI runs these checks, then builds the image and publishes it to GHCR from `main`. Renovate automerges minor and patch updates and checks weekly for new llama.cpp releases. CI doesn't build llama.cpp, so after a llama.cpp update, run `kis build` again.
 

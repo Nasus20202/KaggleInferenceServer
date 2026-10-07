@@ -1,4 +1,5 @@
 import urllib.error
+from email.message import Message
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_gives_up_and_does_not_retry_client_errors(monkeypatch):
 
     def fail(req, timeout):
         calls.append(req)
-        raise urllib.error.HTTPError("http://x", 404, "not found", {}, None)
+        raise urllib.error.HTTPError("http://x", 404, "not found", Message(), None)
 
     monkeypatch.setattr(retry.urllib.request, "urlopen", fail)
     with pytest.raises(urllib.error.HTTPError):

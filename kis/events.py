@@ -1,15 +1,31 @@
-"""Status events published by the server kernel to a private ntfy.sh topic."""
+"""Status events published by the server kernel to a private ntfy topic."""
 
-import contextlib
 import json
+import urllib.request
+from dataclasses import dataclass, replace
 
 from . import retry
+from .schema import ENDED, Event, EventType, Ntfy
+from .settings import Config
+
+HISTORY = "12h"  # how far back to look for sessions: longer than a Kaggle session
 
 
-def fetch(topic: str, since: str) -> list[tuple[str, dict]]:
+@dataclass(frozen=True)
+class Session:
+    """One server session as its events describe it."""
+
+    session: str
+    alive: bool = True
+    endpoint: str | None = None
+    started: float = 0.0  # unix time
+
+
+def fetch(ntfy: Ntfy, topic: str, since: str) -> list[tuple[str, Event]]:
     """(message id, event) pairs newer than `since` (a message id, unix time or duration like 12h)."""
+    req = urllib.request.Request(f"{ntfy.url(topic)}/json?poll=1&since={since}", headers=ntfy.headers())
     try:
-        with retry.urlopen(f"https://ntfy.sh/{topic}/json?poll=1&since={since}", timeout=15, what="ntfy") as r:
+        with retry.urlopen(req, timeout=15, what="ntfy") as r:
             lines = r.read().decode().splitlines()
     except OSError as e:
         print(f"! ntfy: {e}")
@@ -17,46 +33,48 @@ def fetch(topic: str, since: str) -> list[tuple[str, dict]]:
     out = []
     for line in lines:
         msg = json.loads(line)
-        if msg.get("event") == "message":
-            with contextlib.suppress(json.JSONDecodeError, TypeError):  # skip messages not sent by the server
-                event = json.loads(msg["message"])
-                event["at"] = msg["time"]  # unix time ntfy received it
-                out.append((msg["id"], event))
+        if msg.get("event") != "message":  # ntfy's own open/keepalive messages
+            continue
+        try:
+            out.append((msg["id"], Event.from_json(json.loads(msg["message"]), at=msg["time"])))
+        except (ValueError, KeyError, TypeError, AttributeError):  # not an event sent by a kernel
+            continue
     return out
 
 
-def sessions(events: list[dict]) -> dict[str, dict]:
+def sessions(events: list[Event]) -> dict[str, Session]:
     """Server sessions in start order: endpoint, start time and whether they are still up.
     During a rollover two sessions run at once; each event names its session."""
-    out: dict[str, dict] = {}
+    out: dict[str, Session] = {}
     for event in events:
-        s = out.setdefault(event.get("session") or "", {"session": event.get("session") or "", "alive": True})
-        if event["event"] == "ready":
-            s.update(endpoint=event["endpoint"], started=event.get("at", 0) - event.get("t", 0))
-        elif event["event"] in ("stopped", "error"):
-            s["alive"] = False
+        s = out.get(event.session) or Session(event.session)
+        if event.type == EventType.READY:
+            s = replace(s, endpoint=event.endpoint, started=event.at - event.t)
+        elif event.type in ENDED:
+            s = replace(s, alive=False)
+        out[event.session] = s
     return out
 
 
-def current(config: dict, topic: str) -> dict | None:
+def current(config: Config, topic: str) -> Session | None:
     """The newest session that is ready and hasn't stopped, or None."""
-    live = [s for s in sessions([e for _, e in fetch(topic, "12h")]).values() if s["alive"] and "endpoint" in s]
+    events = [e for _, e in fetch(config.ntfy, topic, HISTORY)]
+    live = [s for s in sessions(events).values() if s.alive and s.endpoint]
     if not live:
         return None
-    s = max(live, key=lambda s: s["started"])
-    return {**s, "endpoint": config["tunnel"].get("public_url") or s["endpoint"]}
+    s = max(live, key=lambda s: s.started)
+    return replace(s, endpoint=config.tunnel.public_url or s.endpoint)
 
 
-def endpoint(config: dict, topic: str) -> str | None:
+def endpoint(config: Config, topic: str) -> str | None:
     """Base URL of the running server, or None when no session is up."""
     s = current(config, topic)
-    return s["endpoint"] if s else None
+    return s.endpoint if s else None
 
 
-def show(event: dict):
-    event = dict(event)
-    event.pop("at", None)
-    log = event.pop("log", None)
-    print(f"[{event.pop('t', '?'):>5}s] {event.pop('event')}: {json.dumps(event)}")
+def show(event: Event) -> None:
+    data = dict(event.data)
+    log = data.pop("log", None)
+    print(f"[{event.t:>5}s] {event.type}: {json.dumps(data)}")
     if log:
-        print("    " + log.replace("\n", "\n    "))
+        print("    " + str(log).replace("\n", "\n    "))

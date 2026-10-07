@@ -19,20 +19,36 @@ import subprocess
 import threading
 import time
 import urllib.request
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 from common import fetch, gpu_stats, llama_command, llama_server_binary, publish  # inlined by `kis`
+from kis.schema import (  # inlined by `kis`
+    MAX_PROFILE,
+    PROFILE_CTX,
+    CalibrateConfig,
+    Calibration,
+    Event,
+    EventType,
+    Fit,
+    GpuStats,
+    Model,
+    Topology,
+    dump,
+    load,
+)
 
 # <params> (replaced by `kis calibrate`)
-RUN = ""
-MODELS = {}
-ARGS = []
-NTFY_TOPIC = ""
-REPLICA_MAX_GB = 11.0
+CONFIG = {"run": "", "models": {}}
 # </params>
 
-PROFILES = {"32k": 32768, "64k": 65536, "96k": 98304, "128k": 131072}
+SETTINGS = load(CalibrateConfig, CONFIG)  # checked and typed; see kis/schema.py
+R = TypeVar("R")
+
+PROFILES = PROFILE_CTX
 CTX_STEP = 16384  # granularity of the "max" profile
 MAX_PARALLEL = 32
 MARGIN_MIB = 512
@@ -41,59 +57,82 @@ LOGS = Path("/kaggle/working")
 STARTED = time.time()
 
 
-def notify(event: str, **data):
-    payload = {"event": event, "t": round(time.time() - STARTED), "run": RUN, **data}
-    print(json.dumps(payload), flush=True)
+def notify(kind: EventType, **data: object) -> None:
+    event = Event(kind, t=round(time.time() - STARTED), run=SETTINGS.run, data=data)
+    print(json.dumps(event.to_json()), flush=True)
     try:
-        publish(NTFY_TOPIC, payload)
+        publish(SETTINGS.ntfy, SETTINGS.ntfy_topic, event)
     except OSError as e:
         print("ntfy failed:", e, flush=True)
 
 
-def gpu_used_mib(gpus: list[str]) -> dict[str, tuple[int, int]]:
-    """(used, total) MiB of the given GPUs."""
-    return {str(g["gpu"]): (g["used_mib"], g["total_mib"]) for g in gpu_stats() if str(g["gpu"]) in gpus}
+def gpu_memory(gpus: list[str]) -> dict[str, GpuStats]:
+    """Memory of the given GPUs, by index."""
+    return {str(g.gpu): g for g in gpu_stats() if str(g.gpu) in gpus}
 
 
-def largest(values: list[int], fits, guess: int) -> tuple[int, dict] | None:
-    """Largest value in ascending `values` for which fits(value) returns a result, starting at
+def largest(values: list[int], fits: Callable[[int], R | None], guess: int) -> tuple[int, R] | None:
+    """Largest value in ascending `values` for which fits(value) is not None, starting at
     the value nearest `guess` and binary-searching up or down (fits is monotone)."""
     i = min(max(bisect.bisect_right(values, guess) - 1, 0), len(values) - 1)
-    best = None
-    if result := fits(values[i]):
+    best: tuple[int, R] | None = None
+    if (result := fits(values[i])) is not None:
         best, lo, hi = (values[i], result), i + 1, len(values) - 1
     else:
         lo, hi = 0, i - 1
     while lo <= hi:
         mid = (lo + hi) // 2
-        if result := fits(values[mid]):
+        if (result := fits(values[mid])) is not None:
             best, lo = (values[mid], result), mid + 1
         else:
             hi = mid - 1
     return best
 
 
+@dataclass(frozen=True)
+class Slots:
+    """The most slots of `ctx` tokens that fit (0: none), and the VRAM they use."""
+
+    parallel: int
+    ctx: int
+    used_mib: dict[str, int] = field(default_factory=dict)
+
+    def fit(self, topology: Topology, instances: int) -> Fit:
+        return Fit(topology=topology, instances=instances, parallel=self.parallel, ctx=self.ctx, used_mib=self.used_mib)
+
+
+@dataclass(frozen=True)
+class Speed:
+    single_tps: float  # one request alone
+    total_tps: float  # all slots of one instance busy
+
+
 class Tester:
     """Starts llama-server for one model on one GPU group."""
 
-    def __init__(self, binary: str, model: dict, paths: tuple[str, str | None], gpus: list[str], port: int):
+    def __init__(self, binary: str, model: Model, paths: tuple[str, str | None], gpus: list[str], port: int) -> None:
         self.binary, self.model, self.paths, self.gpus, self.port = binary, model, paths, gpus, port
-        self.n_ctx_train = None
+        self.n_ctx_train: int | None = None
         self.url = f"http://127.0.0.1:{port}"
 
     @contextlib.contextmanager
-    def running(self, parallel: int, ctx: int):
-        """Yield the VRAM use if llama-server starts, serves a request and leaves MARGIN_MIB free, else None."""
-        cmd, env = llama_command(self.binary, self.model, self.paths, self.port, self.gpus, parallel, ctx, ARGS)
+    def running(self, parallel: int, ctx: int) -> Iterator[dict[str, int] | None]:
+        """Yield the VRAM used per GPU (MiB) if llama-server starts, serves a request and
+        leaves MARGIN_MIB free on every GPU, else None."""
+        cmd, env = llama_command(
+            self.binary, self.model, self.paths, self.port, self.gpus, parallel, ctx, SETTINGS.args
+        )
         with open(LOGS / f"calibrate-{self.port}.log", "w") as log:
             proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
-            used = gpu_used_mib(self.gpus) if self._serves(proc) else None
-            if used is not None and len(used) < len(self.gpus):
-                used = None  # nvidia-smi failed: can't tell whether it fits
-            fits = bool(used) and all(total - u >= MARGIN_MIB for u, total in used.values())
+            memory = gpu_memory(self.gpus) if self._serves(proc) else {}
+            # all GPUs reported (nvidia-smi may fail: then we can't tell) and each keeps the margin
+            fits = len(memory) == len(self.gpus) and all(
+                g.total_mib - g.used_mib >= MARGIN_MIB for g in memory.values()
+            )
+            used = {i: g.used_mib for i, g in memory.items()}
             print(f"  gpus={','.join(self.gpus)} parallel={parallel} ctx={ctx}: {fits} {used}", flush=True)
-            yield {"used_mib": {g: u for g, (u, _) in used.items()}} if fits else None
+            yield used if fits else None
         finally:
             proc.terminate()
             try:
@@ -102,7 +141,7 @@ class Tester:
                 proc.kill()
                 proc.wait()
 
-    def _serves(self, proc: subprocess.Popen) -> bool:
+    def _serves(self, proc: subprocess.Popen[bytes]) -> bool:
         deadline = time.time() + 600
         while time.time() < deadline and proc.poll() is None:
             try:
@@ -135,41 +174,42 @@ class Tester:
         with urllib.request.urlopen(req, timeout=900) as r:
             return json.load(r)["usage"]["completion_tokens"]
 
-    def attempt(self, parallel: int, ctx: int) -> dict | None:
+    def attempt(self, parallel: int, ctx: int) -> dict[str, int] | None:
         with self.running(parallel, ctx) as fit:
             return fit
 
-    def max_parallel(self, ctx: int, guess: int | None = None) -> dict:
-        """Most slots that fit at `ctx` per slot."""
+    def max_parallel(self, ctx: int, guess: int | None = None) -> Slots:
+        """Most slots that fit at `ctx` per slot (0 if none)."""
         found = largest(list(range(1, MAX_PARALLEL + 1)), lambda p: self.attempt(p, ctx), guess or MAX_PARALLEL // 2)
-        return {"parallel": found[0], "ctx": ctx, **found[1]} if found else {"parallel": 0, "ctx": ctx}
+        return Slots(found[0], ctx, found[1]) if found else Slots(0, ctx)
 
     def max_ctx(self, guess: int) -> int | None:
         """Largest context (multiple of CTX_STEP, up to the trained context) that fits one slot."""
-        steps = list(range(32768, self.n_ctx_train + 1, CTX_STEP))
-        if self.n_ctx_train not in steps:
-            steps.append(self.n_ctx_train)
+        n_ctx_train = self.n_ctx_train or 32768
+        steps = list(range(32768, n_ctx_train + 1, CTX_STEP))
+        if n_ctx_train not in steps:
+            steps.append(n_ctx_train)
         found = largest(steps, lambda c: self.attempt(1, c), guess)
         return found[0] if found else None
 
-    def bench(self, parallel: int, ctx: int) -> dict:
+    def bench(self, parallel: int, ctx: int) -> Speed | None:
         """Tokens per second of one request alone and of `parallel` concurrent requests."""
         with self.running(parallel, ctx) as fit:
-            if not fit:
-                return {}
+            if fit is None:
+                return None
             start = time.time()
             single = self.complete(BENCH_TOKENS, ignore_eos=True) / (time.time() - start)
             start = time.time()
             with ThreadPoolExecutor(parallel) as pool:
                 tokens = sum(pool.map(lambda _: self.complete(BENCH_TOKENS, ignore_eos=True), range(parallel)))
-            return {"single_tps": round(single, 1), "total_tps": round(tokens / (time.time() - start), 1)}
+            return Speed(single_tps=round(single, 1), total_tps=round(tokens / (time.time() - start), 1))
 
 
-def in_parallel(*jobs):
+def in_parallel(*jobs: Callable[[], R]) -> list[R]:
     """Run jobs (callables) in threads, one per GPU, and return their results."""
-    results = [None] * len(jobs)
+    results: list[R | None] = [None] * len(jobs)
 
-    def run(i, job):
+    def run(i: int, job: Callable[[], R]) -> None:
         results[i] = job()
 
     threads = [threading.Thread(target=run, args=(i, job)) for i, job in enumerate(jobs)]
@@ -177,30 +217,32 @@ def in_parallel(*jobs):
         t.start()
     for t in threads:
         t.join()
-    return results
+    return results  # type: ignore[return-value]  (every job has run)
 
 
-def calibrate(binary: str, gpus: list[str], name: str, model: dict):
-    paths = (fetch(model, model["file"]), fetch(model, model["draft_file"]) if model.get("draft_file") else None)
+def calibrate(binary: str, gpus: list[str], name: str, model: Model) -> None:
+    paths = (fetch(model, model.file), fetch(model, model.draft_file) if model.draft_file else None)
     size_gb = sum(os.path.getsize(p) for p in paths if p) / 1e9
     split = Tester(binary, model, paths, gpus, 8092)
-    replicas = model.get("topology") != "split" and size_gb <= REPLICA_MAX_GB
+    replicas = model.topology != Topology.SPLIT and size_gb <= SETTINGS.replica_max_gb
     a, b = Tester(binary, model, paths, [gpus[0]], 8090), Tester(binary, model, paths, [gpus[-1]], 8091)
     main, instances = (a, len(gpus)) if replicas else (split, 1)
 
-    # Most slots per profile: 32K and 64K searched from scratch, 96K and 128K from their estimates.
+    # Most slots per profile: the two smallest searched from scratch, the others from their estimates.
+    (small, small_ctx), (next_, next_ctx), *larger = PROFILES.items()
     if replicas:
-        r32, r64 = in_parallel(lambda: a.max_parallel(32768), lambda: b.max_parallel(65536))
+        r_small, r_next = in_parallel(lambda: a.max_parallel(small_ctx), lambda: b.max_parallel(next_ctx))
         b.n_ctx_train = b.n_ctx_train or a.n_ctx_train
     else:
-        r32 = split.max_parallel(32768)
-        r64 = split.max_parallel(65536, guess=r32["parallel"] // 2) if (split.n_ctx_train or 0) >= 65536 else None
+        r_small = split.max_parallel(small_ctx)
+        fits_next = (split.n_ctx_train or 0) >= next_ctx
+        r_next = split.max_parallel(next_ctx, guess=r_small.parallel // 2) if fits_next else None
     n_ctx_train = main.n_ctx_train
     if not n_ctx_train:
         raise RuntimeError("llama-server never started")
-    kv_tokens = max(r32["parallel"] * 32768, (r64 or {}).get("parallel", 0) * 65536)
-    found = {"32k": r32, "64k": r64}
-    rest = [k for k in ("96k", "128k") if PROFILES[k] <= n_ctx_train]
+    kv_tokens = max(r_small.parallel * small_ctx, r_next.parallel * next_ctx if r_next else 0)
+    found: dict[str, Slots | None] = {small: r_small, next_: r_next}
+    rest = [k for k, ctx in larger if ctx <= n_ctx_train]
     if replicas:
         jobs = [
             lambda k=k, t=t: t.max_parallel(PROFILES[k], guess=kv_tokens // PROFILES[k])
@@ -210,67 +252,67 @@ def calibrate(binary: str, gpus: list[str], name: str, model: dict):
     else:
         found.update({k: split.max_parallel(PROFILES[k], guess=kv_tokens // PROFILES[k]) for k in rest})
 
-    profiles = {}
+    topology = Topology.REPLICAS if replicas else Topology.SPLIT
+    profiles: dict[str, Fit] = {}
     for key, r in found.items():
         if r is None or PROFILES[key] > n_ctx_train:
             continue
-        if r["parallel"]:
-            profiles[key] = {"topology": "replicas" if replicas else "split", "instances": instances, **r}
+        if r.parallel:
+            profiles[key] = r.fit(topology, instances)
         elif replicas:  # doesn't fit one GPU: split the model over both
             s = split.max_parallel(PROFILES[key], guess=1)
-            if s["parallel"]:
-                profiles[key] = {"topology": "split", "instances": 1, **s}
+            if s.parallel:
+                profiles[key] = s.fit(Topology.SPLIT, 1)
 
     # "max": the largest context that fits one slot, then as many slots as fit at it.
     ctx = main.max_ctx(guess=kv_tokens)
-    topology, tester, n = ("replicas" if replicas else "split"), main, instances
+    tester, n = main, instances
     if replicas and (ctx or 0) < n_ctx_train:
         split.n_ctx_train = n_ctx_train
         split_ctx = split.max_ctx(guess=2 * kv_tokens)
         if (split_ctx or 0) > (ctx or 0):
-            ctx, topology, tester, n = split_ctx, "split", split, 1
+            ctx, topology, tester, n = split_ctx, Topology.SPLIT, split, 1
     if ctx:
-        profiles["max"] = {"topology": topology, "instances": n, **tester.max_parallel(ctx, guess=1)}
+        profiles[MAX_PROFILE] = tester.max_parallel(ctx, guess=1).fit(topology, n)
 
     # Speed of each profile: replica benches alternate between the two GPUs.
     keys = list(profiles)
-    testers = {"replicas": [a, b], "split": [split]}
+    testers = {Topology.REPLICAS: [a, b], Topology.SPLIT: [split]}
 
-    def bench(key: str, tester: Tester):
+    def bench(key: str, tester: Tester) -> None:
         p = profiles[key]
-        speed = tester.bench(p["parallel"], p["ctx"])
-        if "total_tps" in speed:
-            speed["total_tps"] = round(speed["total_tps"] * p["instances"], 1)
-        p.update(speed)
+        if speed := tester.bench(p.parallel, p.ctx):
+            p.single_tps, p.total_tps = speed.single_tps, round(speed.total_tps * p.instances, 1)
 
-    for topo in ("replicas", "split"):
-        todo = [k for k in keys if profiles[k]["topology"] == topo]
+    for topo in Topology:
+        todo = [k for k in keys if profiles[k].topology == topo]
         pool = testers[topo]
         for i in range(0, len(todo), len(pool)):
             chunk = todo[i : i + len(pool)]
             in_parallel(*[lambda k=k, t=t: bench(k, t) for k, t in zip(chunk, pool[: len(chunk)], strict=True)])
 
-    notify("calibrated", model=name, model_gb=round(size_gb, 2), n_ctx_train=n_ctx_train, profiles=profiles)
+    result = Calibration(model=name, model_gb=round(size_gb, 2), n_ctx_train=n_ctx_train, profiles=profiles)
+    notify(EventType.CALIBRATED, **dump(result))
     for p in paths:
         if p:
             os.remove(p)
 
 
-def main():
+def main() -> None:
     binary = llama_server_binary()
     gpus = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], text=True).split()
-    notify("calibrating", models=list(MODELS), gpus=gpu_used_mib(gpus))
-    for name, model in MODELS.items():
+    notify(EventType.CALIBRATING, models=list(SETTINGS.models), gpus=dump(list(gpu_memory(gpus).values())))
+    for name, model in SETTINGS.models.items():
         try:
             calibrate(binary, gpus, name, model)
         except Exception as e:  # keep going with the other models
-            notify("calibrate_failed", model=name, error=repr(e)[:500])
-    notify("calibration_done")
+            notify(EventType.CALIBRATE_FAILED, model=name, error=repr(e)[:500])
+    notify(EventType.CALIBRATION_DONE)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        notify("error", error=repr(e)[:2000])
+        notify(EventType.ERROR, error=repr(e)[:2000])
         raise

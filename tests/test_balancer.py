@@ -3,6 +3,8 @@
 import asyncio
 import json
 
+from kis.schema import GpuStats, Stats, load
+
 AUTH = {"Authorization": "Bearer secret"}
 
 
@@ -106,13 +108,13 @@ async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server,
 
 
 async def test_stats_need_the_key_and_report_gpus_and_requests(aiohttp_client, balancer, server, monkeypatch):
-    monkeypatch.setattr(server, "gpu_stats", lambda: [{"gpu": 0, "used_mib": 9000, "total_mib": 15360}])
+    monkeypatch.setattr(server, "gpu_stats", lambda: [GpuStats(gpu=0, used_mib=9000, total_mib=15360, util_pct=5)])
     client = await aiohttp_client(balancer.app())
     assert (await client.get("/admin/stats")).status == 401
     await client.post("/v1/chat/completions", json={}, headers=AUTH)
-    stats = await (await client.get("/admin/stats", headers=AUTH)).json()
-    assert stats["requests"] == 1 and stats["inflight"] == 0
-    assert stats["gpus"][0]["used_mib"] == 9000
+    stats = load(Stats, await (await client.get("/admin/stats", headers=AUTH)).json())
+    assert stats.requests == 1 and stats.inflight == 0
+    assert stats.gpus[0].used_mib == 9000
 
 
 async def test_logs_tail_only_log_files(aiohttp_client, balancer, server, monkeypatch, tmp_path):
@@ -139,19 +141,19 @@ async def test_stats_include_token_usage_per_model(aiohttp_client, balancer, ser
     with caplog.at_level("INFO", logger="kis"):
         for tokens in (3, 5):
             await client.post("/v1/chat/completions", json={"max_tokens": tokens}, headers=AUTH)
-    usage = (await (await client.get("/admin/stats", headers=AUTH)).json())["usage"]
-    assert usage[server.MODEL["alias"]]["tokens_out"] == 8
+    stats = load(Stats, await (await client.get("/admin/stats", headers=AUTH)).json())
+    assert stats.usage[server.MODEL.alias].tokens_out == 8
     assert any("out=5" in r.getMessage() for r in caplog.records)
 
 
 async def test_max_queue_answers_429_when_full(aiohttp_client, balancer, server, monkeypatch):
-    monkeypatch.setitem(server.CONFIG, "max_queue", 1)
-    monkeypatch.setitem(server.RUNTIME, "slots", 2)  # 2 slots + 1 waiting = 3 accepted at once
+    monkeypatch.setattr(server.SETTINGS, "max_queue", 1)
+    monkeypatch.setattr(server.RUNTIME, "slots", 2)  # 2 slots + 1 waiting = 3 accepted at once
     client = await aiohttp_client(balancer.app())
     resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
     assert sorted(r.status for r in resps) == [200, 200, 200, 429, 429]
     busy = next(r for r in resps if r.status == 429)
     assert busy.headers["Retry-After"] == "5"
-    monkeypatch.setitem(server.CONFIG, "max_queue", None)
+    monkeypatch.setattr(server.SETTINGS, "max_queue", None)
     resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
     assert {r.status for r in resps} == {200}

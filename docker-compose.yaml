@@ -18,5 +18,7 @@ services:
     environment:
       HOME: /home/kis
       KIS_PROXY_API_KEY: ${KIS_PROXY_API_KEY:-} # optional: clients must send this key
+      KIS_NTFY_TOKEN: ${KIS_NTFY_TOKEN:-} # optional: token for a self-hosted ntfy server
+      KIS_NOTIFY_TOKEN: ${KIS_NOTIFY_TOKEN:-} # optional: token for the notification topic
       KIS_LOG_LEVEL: ${KIS_LOG_LEVEL:-INFO}
     restart: unless-stopped

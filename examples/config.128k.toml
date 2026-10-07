@@ -23,9 +23,16 @@ public_url = ""   # e.g. "https://llm.example.com" (named tunnel)
 authkey = ""      # tailscale auth key
 hostname = "kaggle-llm"
 
+[ntfy]
+# Server for kis' event topic (private, random, in .kis/secrets.json): ntfy.sh or self-hosted.
+# A token (or KIS_NTFY_TOKEN) is for servers that require login.
+server = "https://ntfy.sh"
+token = ""
+
 [notify]
-# Optional phone/desktop notifications (ntfy.sh app): model ready, stopped, failed, out-of-memory
+# Optional phone/desktop notifications (ntfy app): model ready, stopped, failed, out-of-memory
 # retries. Never the endpoint or keys. kis' own control topic stays private and random.
+# Posted to the [ntfy] server (with its token) unless `server` is set here.
 # A token (or KIS_NOTIFY_TOKEN) is for access-protected topics.
 topic = ""
 token = ""

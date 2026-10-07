@@ -10,6 +10,7 @@ import random
 import time
 import urllib.error
 import urllib.request
+from http.client import HTTPResponse
 
 ATTEMPTS = 4
 DELAYS = (1.0, 2.0, 4.0, 8.0)  # seconds before retry 1, 2, 3, ... (x 0.5-1.5 jitter)
@@ -27,11 +28,12 @@ def transient(error: Exception) -> bool:
     return isinstance(error, OSError)  # URLError, timeouts, connection resets
 
 
-def urlopen(req: urllib.request.Request | str, timeout: float = 30, what: str = "request"):
+def urlopen(req: urllib.request.Request | str, timeout: float = 30, what: str = "request") -> HTTPResponse:
     """urllib.request.urlopen, retried on transient errors."""
     for attempt in range(ATTEMPTS):
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            response: HTTPResponse = urllib.request.urlopen(req, timeout=timeout)
+            return response
         except Exception as e:
             if attempt == ATTEMPTS - 1 or not transient(e):
                 raise

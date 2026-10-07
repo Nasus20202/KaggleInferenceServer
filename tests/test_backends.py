@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 
@@ -33,8 +35,8 @@ def backends(server, monkeypatch, tmp_path):
     monkeypatch.setattr(server, "launch", launch)
     monkeypatch.setattr(server, "wait_healthy", lambda port, proc: proc.parallel <= state["fits"])
     monkeypatch.setattr(server, "notify", lambda event, **data: state["events"].append((event, data)))
-    monkeypatch.setitem(server.MODEL, "parallel", 8)
-    monkeypatch.setitem(server.CONFIG, "ctx", 32768)
+    monkeypatch.setattr(server, "MODEL", dataclasses.replace(server.MODEL, parallel=8))
+    monkeypatch.setattr(server.SETTINGS, "ctx", 32768)
     return state
 
 
@@ -45,7 +47,7 @@ def test_keeps_context_and_lowers_slots_until_it_fits(server, backends):
     assert [p for p, _ in backends["launched"]] == [8, 8, 6, 6, 5, 5, 4, 4]
     assert {ctx for _, ctx in backends["launched"]} == {32768}
     event, data = backends["events"][-1]
-    assert event == "backends_ready"
+    assert event == server.EventType.BACKENDS_READY
     assert (data["slots"], data["parallel"], data["ctx"]) == (8, 4, 32768)
 
 
@@ -54,4 +56,4 @@ def test_gives_up_on_other_errors(server, backends):
     with pytest.raises(RuntimeError):
         server.start_backends("model.gguf", None)
     assert backends["launched"] == [(8, 32768), (8, 32768)]
-    assert backends["events"][-1][0] == "error"
+    assert backends["events"][-1][0] == server.EventType.ERROR

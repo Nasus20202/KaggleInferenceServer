@@ -1,11 +1,15 @@
 """kaggle/calibrate.py search logic, with llama-server attempts faked by a KV budget."""
 
+import dataclasses
 import importlib.util
 from pathlib import Path
 
 import pytest
 
 from kis import kaggle
+from kis.schema import Calibration, Model, Topology, load
+
+MODEL = Model(repo="r", file="m.gguf", alias="m", parallel=1)
 
 
 @pytest.fixture
@@ -21,10 +25,10 @@ def calibrate():
 
 def fake_tester(calibrate, budget: int, n_ctx_train: int = 262144):
     """A Tester whose attempts fit while parallel x ctx <= budget tokens; records attempts."""
-    t = calibrate.Tester("llama-server", {}, ("m.gguf", None), ["0"], 8090)
+    t = calibrate.Tester("llama-server", MODEL, ("m.gguf", None), ["0"], 8090)
     t.n_ctx_train, t.tries = n_ctx_train, []
     t.attempt = lambda parallel, ctx: (
-        t.tries.append((parallel, ctx)) or ({"used_mib": {}} if parallel * ctx <= budget else None)
+        t.tries.append((parallel, ctx)) or ({"0": 1000} if parallel * ctx <= budget else None)
     )
     return t
 
@@ -37,11 +41,11 @@ def test_largest_finds_the_boundary_from_any_guess(calibrate, guess):
 
 
 def test_max_parallel(calibrate):
-    assert fake_tester(calibrate, budget=7 * 32768).max_parallel(32768)["parallel"] == 7
-    assert fake_tester(calibrate, budget=100 * 32768).max_parallel(32768)["parallel"] == calibrate.MAX_PARALLEL
-    assert fake_tester(calibrate, budget=1000).max_parallel(32768)["parallel"] == 0
+    assert fake_tester(calibrate, budget=7 * 32768).max_parallel(32768) == calibrate.Slots(7, 32768, {"0": 1000})
+    assert fake_tester(calibrate, budget=100 * 32768).max_parallel(32768).parallel == calibrate.MAX_PARALLEL
+    assert fake_tester(calibrate, budget=1000).max_parallel(32768) == calibrate.Slots(0, 32768)
     tester = fake_tester(calibrate, budget=3 * 65536)
-    assert tester.max_parallel(65536, guess=3)["parallel"] == 3
+    assert tester.max_parallel(65536, guess=3).parallel == 3
     assert len(tester.tries) <= 6  # a good guess needs few starts
 
 
@@ -52,7 +56,7 @@ def test_max_ctx_is_capped_by_the_trained_context(calibrate):
 
 
 def test_render_keeps_the_constants_outside_params():
-    source = kaggle.render("calibrate.py", {"MODELS": {}, "ARGS": [], "NTFY_TOPIC": "t"})
+    source = kaggle.render("calibrate.py", {"CONFIG": {"run": "1", "models": {}, "ntfy_topic": "t"}})
     namespace = {"__name__": "calibrate"}
     exec(source, namespace)
     assert namespace["MARGIN_MIB"] and namespace["MAX_PARALLEL"]
@@ -64,41 +68,41 @@ def run_calibrate(calibrate, monkeypatch, size_gb: float, budget_per_gpu: int, n
 
     def attempt(self, parallel, ctx):
         self.n_ctx_train = n_ctx_train
-        return {"used_mib": {}} if parallel * ctx <= budget_per_gpu * len(self.gpus) else None
+        return {"0": 1000} if parallel * ctx <= budget_per_gpu * len(self.gpus) else None
 
     monkeypatch.setattr(calibrate.Tester, "attempt", attempt)
-    monkeypatch.setattr(calibrate.Tester, "bench", lambda self, p, c: {"single_tps": 40.0, "total_tps": 10.0 * p})
+    monkeypatch.setattr(calibrate.Tester, "bench", lambda self, p, c: calibrate.Speed(40.0, 10.0 * p))
     monkeypatch.setattr(calibrate, "fetch", lambda model, file: file)
     monkeypatch.setattr(calibrate.os.path, "getsize", lambda p: size_gb * 1e9)
     monkeypatch.setattr(calibrate.os, "remove", lambda p: None)
     monkeypatch.setattr(calibrate, "notify", lambda event, **data: events.append(data))
-    calibrate.calibrate("llama-server", ["0", "1"], "m", model or {"file": "m.gguf"})
-    return events[-1]["profiles"]
+    calibrate.calibrate("llama-server", ["0", "1"], "m", model or MODEL)
+    return load(Calibration, events[-1]).profiles
 
 
 def test_calibrate_small_model_fills_context_then_slots(calibrate, monkeypatch):
     profiles = run_calibrate(calibrate, monkeypatch, size_gb=3, budget_per_gpu=300000, n_ctx_train=262144)
-    assert {k: (p["topology"], p["parallel"], p["ctx"]) for k, p in profiles.items()} == {
+    assert {k: (p.topology, p.parallel, p.ctx) for k, p in profiles.items()} == {
         "32k": ("replicas", 9, 32768),
         "64k": ("replicas", 4, 65536),
         "96k": ("replicas", 3, 98304),
         "128k": ("replicas", 2, 131072),
         "max": ("replicas", 1, 262144),  # capped by the trained context
     }
-    assert profiles["32k"]["total_tps"] == 180.0  # 2 replicas x 9 slots x 10
+    assert profiles["32k"].total_tps == 180.0  # 2 replicas x 9 slots x 10
 
 
 def test_calibrate_splits_what_does_not_fit_one_gpu(calibrate, monkeypatch):
     profiles = run_calibrate(calibrate, monkeypatch, size_gb=5, budget_per_gpu=100000, n_ctx_train=262144)
-    assert profiles["64k"]["topology"] == "replicas"
-    assert (profiles["128k"]["topology"], profiles["128k"]["parallel"]) == ("split", 1)
-    assert (profiles["max"]["topology"], profiles["max"]["ctx"]) == ("split", 196608)
+    assert profiles["64k"].topology == Topology.REPLICAS
+    assert (profiles["128k"].topology, profiles["128k"].parallel) == (Topology.SPLIT, 1)
+    assert (profiles["max"].topology, profiles["max"].ctx) == (Topology.SPLIT, 196608)
 
 
 def test_calibrate_split_model(calibrate, monkeypatch):
-    model = {"file": "m.gguf", "topology": "split"}
+    model = dataclasses.replace(MODEL, topology=Topology.SPLIT)
     profiles = run_calibrate(calibrate, monkeypatch, size_gb=17, budget_per_gpu=80000, n_ctx_train=262144, model=model)
-    assert {k: (p["parallel"], p["ctx"]) for k, p in profiles.items()} == {
+    assert {k: (p.parallel, p.ctx) for k, p in profiles.items()} == {
         "32k": (4, 32768),
         "64k": (2, 65536),
         "96k": (1, 98304),

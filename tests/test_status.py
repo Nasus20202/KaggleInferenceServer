@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
 
 from kis import status
+from kis.schema import Stats, load
 
 
 def test_format_quota():
-    q = {"used_h": 1.65, "total_h": 30.0, "reset": datetime(2026, 10, 10, tzinfo=UTC)}
+    q = status.Quota(used_h=1.65, total_h=30.0, reset=datetime(2026, 10, 10, tzinfo=UTC))
     line = status.format_quota(q, now=datetime(2026, 10, 7, 5, 0, tzinfo=UTC))
     assert line.startswith("GPU quota: 28.4 h left of 30 h (1.6 h used), resets ")
     assert line.endswith("(in 2d 19h)")
@@ -13,6 +14,8 @@ def test_format_quota():
 
 def test_format_stats():
     stats = {
+        "session": "s",
+        "parallel": 2,
         "model": "m",
         "topology": "replicas",
         "slots": 4,
@@ -36,7 +39,7 @@ def test_format_stats():
             }
         },
     }
-    text = status.format_stats(stats)
+    text = status.format_stats(load(Stats, stats))
     assert "4 slots x 131072 tokens" in text
     assert "GPU0: 13.6 / 15.0 GiB VRAM, 87% busy" in text
     assert "m: 2 completions, tokens in 200 (cached 160, 80%), out 100; prefill 200.0 tok/s" in text
