@@ -2,6 +2,7 @@
 
 kis build              compile llama-server for T4 once
 kis up qwen35-9b       start the server kernel and wait for its endpoint
+kis use gemma-4-12b    swap the running session to another preset (no preset: list them)
 kis proxy              local endpoint http://127.0.0.1:8080/v1 (any API key)
 kis bench              aggregate tok/s vs concurrency
 kis calibrate          measure slots, context and speed of each preset on the T4s
@@ -55,9 +56,12 @@ def cmd_build(args: argparse.Namespace, config: Config) -> None:
 
 
 def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) -> ServerConfig:
-    """Settings of a server session: the preset `args.model` with the command line's overrides."""
+    """Settings of a server session: it starts with the preset `args.model`, with the command
+    line's overrides, and can swap to every other preset of config.toml."""
     if args.model not in config.models:
         sys.exit(f"unknown model {args.model!r}; choose from: {', '.join(config.models)}")
+    if unknown := [n for n in config.server.prefetch if n not in config.models]:
+        sys.exit(f"server.prefetch: unknown models {', '.join(unknown)}")
     model = config.models[args.model]
     if args.parallel:
         model = dataclasses.replace(model, parallel=args.parallel)
@@ -73,6 +77,10 @@ def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) ->
     return ServerConfig(
         api_key=secrets.api_key,
         model=model,
+        preset=args.model,
+        models={**config.models, args.model: model},
+        autoload=server.autoload,
+        prefetch=[n for n in server.prefetch if n != args.model],
         ntfy=config.ntfy,
         ntfy_topic=secrets.ntfy_topic,
         notify=config.notify,
@@ -103,8 +111,13 @@ def _drop_options(args: list[str], *names: str) -> list[str]:
 def cmd_up(args: argparse.Namespace, config: Config) -> None:
     secrets = load_secrets()
     server = server_config(args, config, secrets)
-    if (url := events.endpoint(config, secrets.ntfy_topic)) and not args.force:
-        sys.exit(f"a server is already up at {url}; `kis down` first (or --force)")
+    if (current := events.current(config, secrets.ntfy_topic)) and not args.force:
+        if args.parallel or args.topology or args.ctx or args.no_spec:
+            sys.exit(
+                f"a server is already up at {current.endpoint}; `kis down` first (or --force) to change its settings"
+            )
+        swap(config, secrets, current, args.model)  # same as `kis use`
+        return
     q = status.quota()
     print(status.format_quota(q))
     if q and q.left_h < 0.5:
@@ -142,6 +155,67 @@ def follow(
             state = kaggle.state(config, slug or kaggle.SERVER)
             if state.ended:
                 sys.exit(f"kernel ended: {state}")
+        time.sleep(EVENT_POLL_S)
+
+
+def cmd_use(args: argparse.Namespace, config: Config) -> None:
+    secrets = load_secrets()
+    current = events.current(config, secrets.ntfy_topic)
+    if not args.model:
+        list_models(config, secrets, current)
+    elif not current:
+        sys.exit(f"no running server; `kis up {args.model}`")
+    else:
+        swap(config, secrets, current, args.model)
+
+
+def list_models(config: Config, secrets: Secrets, current: events.Session | None) -> None:
+    """The running session's presets and their status, or config.toml's when none runs."""
+    if current and current.endpoint:
+        try:
+            print(status.format_models(AdminClient(current.endpoint, secrets.api_key).models()))
+            return
+        except (OSError, RuntimeError) as e:
+            print(f"! server: {e}; presets in config.toml:")
+    else:
+        print("no running server; presets in config.toml (`kis up <preset>`):")
+    presets = [
+        {"preset": name, "id": m.alias, "context_length": m.ctx or config.server.ctx, "parallel": m.parallel}
+        for name, m in config.models.items()
+    ]
+    print(status.format_models(presets))
+
+
+def swap(config: Config, secrets: Secrets, current: events.Session, model: str) -> None:
+    """Swap the running session to preset `model` and print its events until it serves."""
+    assert current.endpoint
+    since = str(int(time.time()))
+    code, answer = AdminClient(current.endpoint, secrets.api_key).load(model)
+    if code == HTTPStatus.OK:
+        print(f"{answer['model']} is already loaded")
+    elif code == HTTPStatus.ACCEPTED:
+        session = answer.get("session") or current.session  # a named tunnel may reach the other session
+        print(f"loading {answer['model']} in session {session}")
+        wait_loaded(config, secrets.ntfy_topic, since, session, answer["preset"])
+    else:
+        sys.exit((answer.get("error") or {}).get("message") or f"HTTP {code.value} {code.phrase}")
+    state = load_state()
+    state.model = answer["model"]
+    save_state(state)
+
+
+def wait_loaded(config: Config, topic: str, since: str, session: str, preset: str) -> None:
+    """Print the events of `session` until `preset` is loaded; exit if loading it fails."""
+    while True:
+        for msg_id, event in events.fetch(config.ntfy, topic, since):
+            since = msg_id
+            if event.session != session:
+                continue
+            events.show(event)
+            if event.data.get("preset") == preset and event.type == EventType.MODEL_READY:
+                return
+            if (event.data.get("preset") == preset and event.type == EventType.MODEL_FAILED) or event.type in ENDED:
+                sys.exit(f"loading {preset} failed: {event.problem}")
         time.sleep(EVENT_POLL_S)
 
 
@@ -259,7 +333,11 @@ def cmd_bench(args: argparse.Namespace, config: Config) -> None:
     if not url:
         sys.exit("no running server")
     levels = [int(c) for c in args.concurrency.split(",")]
-    model = load_state().model or "model"
+    try:  # the loaded preset: naming another one would swap to it
+        stats = AdminClient(url, secrets.api_key).stats()
+    except OSError:
+        stats = None
+    model = stats.model if stats else load_state().model or "model"
     bench.run(url, secrets.api_key, model, levels, args.max_tokens, args.min_requests)
 
 
@@ -279,7 +357,10 @@ def main() -> None:
     p.add_argument("--topology", type=Topology, choices=list(Topology))
     p.add_argument("--ctx", type=int, help="context per slot in tokens")
     p.add_argument("--no-spec", action="store_true", help="disable MTP speculative decoding")
-    p.add_argument("--force", action="store_true", help="push even if a server is already up")
+    p.add_argument("--force", action="store_true", help="start a new session even if one is up")
+
+    p = sub.add_parser("use", help="swap the running session to another preset; without one, list them")
+    p.add_argument("model", nargs="?", help="preset name or alias")
 
     p = sub.add_parser("calibrate", help="measure slots, context and speed per preset on Kaggle")
     p.add_argument("models", nargs="*", help="presets to measure (default: all)")

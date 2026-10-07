@@ -53,6 +53,13 @@ replica_max_gb = 11.0
 # guaranteed this much: the KV cache holds parallel x ctx tokens. If it doesn't fit,
 # the server starts with fewer slots instead of less context.
 ctx = 32768
+# A request whose `model` names another preset (by name or alias) swaps the session to
+# it: requests in flight finish, new ones wait while it loads. Requests without a known
+# model name go to the loaded preset. false = only `kis use` swaps.
+autoload = true
+# Presets to download in the background once the server is ready, so swapping to them
+# only loads them (each takes disk space on the kernel for the session).
+prefetch = []
 # Arguments for every model; per-model `args` are appended.
 args = [
   "--n-gpu-layers", "999",

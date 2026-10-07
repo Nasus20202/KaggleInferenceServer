@@ -92,3 +92,14 @@ def test_fetch_polls_the_configured_server_with_its_token(monkeypatch):
     assert got == [("1", Event(EventType.READY, data={"endpoint": "u"}, at=5))]
     assert seen[0].full_url == "https://ntfy.example.com/kis-x/json?poll=1&since=12h"
     assert seen[0].get_header("Authorization") == "Bearer tk"
+
+
+def test_sessions_track_the_loaded_preset():
+    feed = [
+        Event(EventType.READY, session="s", data={"endpoint": "https://a", "preset": "qwen35-4b"}),
+        Event(EventType.MODEL_LOADING, session="s", data={"preset": "gemma-4-12b"}),
+        Event(EventType.MODEL_FAILED, session="s", data={"preset": "gemma-4-12b"}),
+    ]
+    assert events.sessions(feed)["s"].preset == "qwen35-4b"
+    feed.append(Event(EventType.MODEL_READY, session="s", data={"preset": "gemma-4-12b"}))
+    assert events.sessions(feed)["s"].preset == "gemma-4-12b"

@@ -5,6 +5,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http import HTTPStatus
+from typing import Any
 
 from . import retry
 from .schema import Route, Stats, load
@@ -30,6 +31,24 @@ class AdminClient:
         """Live stats, or None if the server answered with an error (OSError if unreachable)."""
         code, body = self._call(Route.STATS)
         return load(Stats, json.loads(body), "stats", strict=False) if code == HTTPStatus.OK else None
+
+    def load(self, model: str) -> tuple[HTTPStatus, dict[str, Any]]:
+        """Ask the server to swap to `model` (a preset name or alias): OK if it is loaded,
+        ACCEPTED while it loads, NOT_FOUND if the session has no such preset."""
+        code, body = self._call(Route.LOAD, "POST", model=model)
+        try:
+            answer = json.loads(body)
+        except ValueError:
+            answer = {"error": {"message": body.decode(errors="replace")}}
+        return HTTPStatus(code), answer
+
+    def models(self) -> list[dict[str, Any]]:
+        """The session's presets as /v1/models lists them (id, preset, status); raises
+        RuntimeError with the server's answer."""
+        code, body = self._call(Route.MODELS)
+        if code != HTTPStatus.OK:
+            raise RuntimeError(body.decode(errors="replace"))
+        return json.loads(body)["data"]
 
     def shutdown(self, session: str) -> HTTPStatus:
         """Ask `session` to stop: OK, or CONFLICT if the URL reached another session."""

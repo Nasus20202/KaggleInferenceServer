@@ -1,8 +1,14 @@
-"""Kaggle script: serve one GGUF model with llama-server behind an
+"""Kaggle script: serve GGUF models with llama-server behind an
 OpenAI-compatible, API-key protected balancer, exposed through a tunnel.
 
   replicas  model fits one T4 -> one llama-server per GPU (about 2x aggregate tok/s)
   split     larger model      -> one llama-server across both GPUs
+
+One preset is loaded at a time. A request whose `model` names another preset of the
+session (autoload), or POST /admin/load, swaps to it: the new preset is downloaded
+while the loaded one keeps serving, then requests in flight finish, new ones wait,
+and the instances are replaced. Requests without a known model name go to the loaded
+preset. GET /v1/models lists every preset with its status.
 
 Started by `kis up <model>`, which fills in CONFIG. Status events, the endpoint
 URL and a periodic stats heartbeat go to a private ntfy topic; everything is
@@ -17,6 +23,7 @@ import asyncio
 import contextlib
 import dataclasses
 import enum
+import functools
 import json
 import logging
 import os
@@ -26,10 +33,10 @@ import sys
 import threading
 import time
 import urllib.request
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any, Protocol
 
 import aiohttp
 from aiohttp import web
@@ -39,6 +46,8 @@ from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     Event,
     EventType,
+    Model,
+    ModelStatus,
     Route,
     ServerConfig,
     Stats,
@@ -61,6 +70,10 @@ CONFIG = {
         "alias": "Qwen3.5-4B-Q4_K_M",
         "parallel": 16,
     },
+    "preset": "qwen35-4b",
+    "models": {},
+    "autoload": True,
+    "prefetch": [],
     "ntfy": {"server": "https://ntfy.sh", "token": ""},
     "ntfy_topic": "",
     "session": "",
@@ -76,20 +89,25 @@ CONFIG = {
 # </params>
 
 SETTINGS = load(ServerConfig, CONFIG)  # checked and typed; see kis/schema.py for each field
-MODEL = SETTINGS.model
+MODEL = SETTINGS.model  # loaded first
+PRESETS = SETTINGS.models or {SETTINGS.preset or MODEL.alias: MODEL}  # name -> preset the session can load
+START = SETTINGS.preset if SETTINGS.preset in PRESETS else next(iter(PRESETS))
 WORK = Path("/kaggle/working")
 PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
 STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
+DRAIN_POLL_S = 0.1  # how often a swap checks whether the requests in flight have finished
 STARTED = time.time()
 log = logging.getLogger("kis")
 
 
 @dataclass
 class Runtime:
-    """Layout of the running backends."""
+    """The loaded preset and the layout of its backends."""
 
+    preset: str = ""
+    model: str = ""  # its alias
     topology: Topology = Topology.REPLICAS
     slots: int = 0  # parallel x instances
     parallel: int = 0  # slots per instance
@@ -146,7 +164,7 @@ def notify(kind: EventType, **data: object) -> None:
 def notification(event: Event) -> Notification | None:
     """The phone notification for events worth one. Never includes the endpoint or keys:
     the notification topic may be public."""
-    model = MODEL.alias
+    model = event.data.get("model") or RUNTIME.model or MODEL.alias
     if event.type == EventType.READY:
         layout = f"{RUNTIME.slots} slots x {RUNTIME.ctx} tokens"
         message = f"{layout}, ready after {event.t} s"
@@ -158,6 +176,13 @@ def notification(event: Event) -> Notification | None:
     if event.type == EventType.RETRY:
         slots = event.data.get("parallel")
         return Notification(f"{model}: out of memory", f"retrying with {slots} slots", Priority.LOW, "hourglass")
+    if event.type == EventType.MODEL_READY:
+        layout = f"{event.data.get('slots')} slots x {event.data.get('ctx')} tokens"
+        return Notification(
+            f"{model} loaded", f"{layout}, after {event.data.get('seconds')} s", tags="arrows_counterclockwise"
+        )
+    if event.type == EventType.MODEL_FAILED:
+        return Notification(f"{model} failed to load", event.problem[:300], Priority.HIGH, "warning")
     return None
 
 
@@ -176,11 +201,58 @@ def download(url: str, path: str) -> str:
 # --------------------------------------------------------------------------- llama-server instances
 
 
+FETCHED: dict[str, str] = {}  # repo@revision/file -> local path, downloaded and checked this session
+FETCH_LOCKS: dict[str, threading.Lock] = {}  # one download of a file at a time (prefetch and swaps)
+
+
+def _file_key(model: Model, file: str) -> str:
+    return f"{model.repo}@{model.revision}/{file}"
+
+
+def _fetch_once(model: Model, file: str, sha256: str | None) -> str:
+    key = _file_key(model, file)
+    with FETCH_LOCKS.setdefault(key, threading.Lock()):
+        if key not in FETCHED:
+            FETCHED[key] = fetch(model, file, sha256)
+        return FETCHED[key]
+
+
+def model_files(model: Model) -> tuple[str, str | None]:
+    """Local paths of a preset's model and draft. Each file is downloaded and its sha256
+    checked once per session: hashing the 27B again would add a minute to every swap."""
+    draft = _fetch_once(model, model.draft_file, model.draft_sha256) if model.draft_file else None
+    return _fetch_once(model, model.file, model.sha256), draft
+
+
+def downloaded(model: Model) -> bool:
+    files = [model.file] + ([model.draft_file] if model.draft_file else [])
+    return all(_file_key(model, f) in FETCHED for f in files)
+
+
+def prefetch(names: list[str]) -> None:
+    """Download presets in the background, so swapping to them only has to load them."""
+    for name in names:
+        try:
+            model_files(PRESETS[name])
+            log.info("prefetched %s", name)
+        except Exception:
+            log.exception("prefetch of %s failed", name)
+
+
+server_binary = functools.cache(llama_server_binary)
+
+
 def launch(
-    binary: str, model_path: str, draft_path: str | None, port: int, gpu_ids: list[str], parallel: int, ctx: int
+    binary: str,
+    model: Model,
+    paths: tuple[str, str | None],
+    port: int,
+    gpu_ids: list[str],
+    parallel: int,
+    ctx: int,
 ) -> subprocess.Popen[bytes]:
     """One llama-server with `parallel` slots of `ctx` tokens each (KV pool = parallel x ctx)."""
-    cmd, env = llama_command(binary, MODEL, (model_path, draft_path), port, gpu_ids, parallel, ctx, SETTINGS.args)
+    cmd, env = llama_command(binary, model, paths, port, gpu_ids, parallel, ctx, SETTINGS.args)
     return subprocess.Popen(cmd, env=env, stdout=log_file(f"llama-{port}.log"), stderr=subprocess.STDOUT)
 
 
@@ -204,22 +276,32 @@ def plan(
 
 
 OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
+FITTED: dict[str, int] = {}  # preset -> slots per instance that fit, so loading it again skips the retries
 
 
-def start_backends(model_path: str, draft_path: str | None) -> dict[int, subprocess.Popen[bytes]]:
-    """Start one llama-server per GPU group. The context per slot is fixed; if the KV pool
-    doesn't fit, retry with fewer slots."""
-    binary = llama_server_binary()
+class BackendsFailed(RuntimeError):
+    """llama-server didn't start; `log` is the tail of its output."""
+
+    def __init__(self, message: str, log: str) -> None:
+        super().__init__(message)
+        self.log = log
+
+
+def start_backends(name: str) -> dict[int, subprocess.Popen[bytes]]:
+    """Start one llama-server per GPU group for preset `name`. The context per slot is
+    fixed; if the KV pool doesn't fit, retry with fewer slots."""
+    model = PRESETS[name]
+    paths = model_files(model)
+    binary = server_binary()
     gpus = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], text=True).split()
-    size_gb = sum(os.path.getsize(p) for p in (model_path, draft_path) if p) / 1e9
-    topology, groups = plan(gpus, size_gb, MODEL.topology, SETTINGS.replica_max_gb)
-    parallel, ctx = MODEL.parallel, MODEL.ctx or SETTINGS.ctx
+    size_gb = sum(os.path.getsize(p) for p in paths if p) / 1e9
+    topology, groups = plan(gpus, size_gb, model.topology, SETTINGS.replica_max_gb)
+    parallel, ctx = FITTED.get(name, model.parallel), model.ctx or SETTINGS.ctx
 
     ports = range(BACKEND_PORT, BACKEND_PORT + len(groups))
     while True:
         backends = {
-            port: launch(binary, model_path, draft_path, port, g, parallel, ctx)
-            for port, g in zip(ports, groups, strict=True)
+            port: launch(binary, model, paths, port, g, parallel, ctx) for port, g in zip(ports, groups, strict=True)
         }
         failed = next((port for port, proc in backends.items() if not wait_healthy(port, proc)), None)
         if failed is None:
@@ -230,13 +312,62 @@ def start_backends(model_path: str, draft_path: str | None) -> dict[int, subproc
         tail = (WORK / f"llama-{failed}.log").read_text()[-3000:]
         if OOM.search(tail) and parallel > 1:
             parallel -= max(1, parallel // 4)
-            notify(EventType.RETRY, reason="out of memory", parallel=parallel, ctx=ctx)
+            notify(EventType.RETRY, reason="out of memory", model=model.alias, parallel=parallel, ctx=ctx)
             continue
-        notify(EventType.ERROR, error="llama-server failed to start (lower --ctx or --parallel?)", log=tail)
-        raise RuntimeError("llama-server failed to start")
-    RUNTIME.topology, RUNTIME.slots, RUNTIME.parallel, RUNTIME.ctx = topology, parallel * len(groups), parallel, ctx
+        raise BackendsFailed(f"llama-server failed to start with {name} (lower --ctx or --parallel?)", tail)
+    FITTED[name] = parallel
+    RUNTIME.preset, RUNTIME.model, RUNTIME.topology = name, model.alias, topology
+    RUNTIME.slots, RUNTIME.parallel, RUNTIME.ctx = parallel * len(groups), parallel, ctx
     notify(EventType.BACKENDS_READY, model_gb=round(size_gb, 2), **dump(RUNTIME), gpus=dump(gpu_stats()))
     return backends
+
+
+class BackendSet(Protocol):
+    """What the balancer needs of the backends (Backends, or a stand-in in the tests)."""
+
+    @property
+    def ports(self) -> list[int]: ...
+    def fetch(self, name: str) -> None: ...
+    def downloaded(self, name: str) -> bool: ...
+    def load(self, name: str) -> list[int]: ...
+
+
+class Backends:
+    """The llama-server instances of the loaded preset. Blocking: the balancer calls
+    fetch and load in a thread."""
+
+    def __init__(self) -> None:
+        self.procs: dict[int, subprocess.Popen[bytes]] = {}
+
+    @property
+    def ports(self) -> list[int]:
+        return list(self.procs)
+
+    def fetch(self, name: str) -> None:
+        model_files(PRESETS[name])
+
+    def downloaded(self, name: str) -> bool:
+        return downloaded(PRESETS[name])
+
+    def load(self, name: str) -> list[int]:
+        """Replace the running instances with preset `name`'s; return their ports."""
+        self.stop()
+        self.procs = start_backends(name)
+        return self.ports
+
+    def stop(self) -> None:
+        for proc in self.procs.values():
+            proc.terminate()
+        for proc in self.procs.values():
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        self.procs = {}
+
+    def exited(self) -> bool:
+        return any(proc.poll() is not None for proc in self.procs.values())
 
 
 # --------------------------------------------------------------------------- balancer
@@ -343,11 +474,38 @@ class Usage:
         )
 
 
-class Balancer:
-    """Checks the API key and sends each request to the instance with the fewest in flight."""
+MODEL_ROUTES = (Route.MODELS, "/models")
 
-    def __init__(self, ports: list[int], api_key: str) -> None:
-        self.inflight = {port: 0 for port in ports}
+
+class SwapFailed(RuntimeError):
+    """The requested preset can't be served: loading it failed, or autoload is off."""
+
+
+@dataclass
+class Swap:
+    """A swap in progress: first downloading (the loaded preset keeps serving), then
+    draining the requests in flight and loading."""
+
+    target: str
+    task: "asyncio.Task[str | None] | None" = None  # result: an error, or None
+    downloading: bool = True
+
+
+class Balancer:
+    """Checks the API key, swaps to the preset a request names (autoload) and sends each
+    request to the instance of the loaded preset with the fewest in flight."""
+
+    def __init__(
+        self, backends: BackendSet, api_key: str, presets: dict[str, Model] | None = None, loaded: str = ""
+    ) -> None:
+        self.backends = backends
+        self.presets = presets or PRESETS
+        self.loaded = loaded or START  # preset name
+        self.inflight = {port: 0 for port in backends.ports}
+        self.swap: Swap | None = None
+        self.waiting = 0  # requests waiting for a swap
+        self.failure = ""  # why the session must stop: a failed swap left no preset loaded
+        self.loads: set[asyncio.Task[None]] = set()  # swaps started by /admin/load
         self.api_key = api_key
         self.last_activity = time.time()
         self.stop = asyncio.Event()
@@ -358,7 +516,13 @@ class Balancer:
 
     @property
     def idle_seconds(self) -> float:
-        return 0 if any(self.inflight.values()) else time.time() - self.last_activity
+        busy = self.swap or self.waiting or any(self.inflight.values())
+        return 0 if busy else time.time() - self.last_activity
+
+    @property
+    def loading(self) -> bool:
+        """True while a swap has stopped (or is stopping) the loaded preset's instances."""
+        return self.swap is not None and not self.swap.downloading
 
     def app(self) -> web.Application:
         async def client_session(app: web.Application) -> AsyncIterator[None]:
@@ -396,6 +560,10 @@ class Balancer:
             return web.json_response(dump(await self.stats()))
         if req.path == Route.LOGS:
             return self.logs(req)
+        if req.path == Route.LOAD and req.method == "POST":
+            return self.load(req.query.get("model", ""))
+        if req.path in MODEL_ROUTES and req.method == "GET":
+            return web.json_response(self.models())
         if self.full():
             log.warning("%s %s 429 (all slots busy, queue full)", req.method, req.path)
             return web.json_response(
@@ -403,18 +571,37 @@ class Balancer:
                 status=429,
                 headers={"Retry-After": "5"},
             )
-        port = min(self.inflight, key=lambda p: self.inflight[p])
-        self.inflight[port] += 1
+        self.waiting += 1  # counted at once, so concurrent requests see each other in full()
+        admitted = False
         self.requests += 1
         self.last_activity = start = time.time()
-        status, detail = 0, ""
+        port, status, detail = 0, 0, ""
+
+        async def connect() -> aiohttp.ClientResponse:
+            nonlocal port, admitted
+            port = await self.admit(name)
+            self.waiting -= 1  # now in flight
+            admitted = True
+            headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
+            assert self.session, "app() not started"
+            return await self.session.request(
+                req.method, f"http://127.0.0.1:{port}{req.rel_url}", data=body, headers=headers
+            )
+
         try:
-            resp, sse, captured = await self.forward(req, f"http://127.0.0.1:{port}{req.rel_url}")
+            body = await req.read()
+            try:
+                name = self.requested(req, body)
+            except SwapFailed as e:
+                status = 400
+                error = api_error(str(e), type="invalid_request_error", code="model_not_loaded")
+                return web.json_response(error, status=status)
+            resp, sse, captured = await self.forward(req, body, connect)
             status = resp.status
             if status >= 500:
                 self.errors += 1
             if req.method == "POST" and (c := parse_usage(bytes(captured), sse)):
-                self.usage.setdefault(c.model or MODEL.alias, Usage()).add(c)
+                self.usage.setdefault(c.model or self.presets[self.loaded].alias, Usage()).add(c)
                 detail = " " + c.describe()
             return resp
         except Exception:
@@ -422,7 +609,10 @@ class Balancer:
             log.exception("%s %s -> :%d failed", req.method, req.path, port)
             raise
         finally:
-            self.inflight[port] -= 1
+            if admitted:
+                self.inflight[port] -= 1
+            else:
+                self.waiting -= 1
             self.last_activity = time.time()
             took = time.time() - start
             log.info("%s %s -> :%d %s %.2fs%s", req.method, req.path, port, status or "-", took, detail)
@@ -431,12 +621,173 @@ class Balancer:
         """True when max_queue is set and that many requests already wait beyond the slots."""
         limit = SETTINGS.max_queue
         slots = RUNTIME.slots or len(self.inflight)
-        return limit is not None and sum(self.inflight.values()) >= slots + limit
+        return limit is not None and sum(self.inflight.values()) + self.waiting >= slots + limit
+
+    # ----------------------------------------------------------------------- presets and swaps
+
+    def resolve(self, name: object) -> str | None:
+        """The preset called `name` (its preset name or alias), or None."""
+        if not isinstance(name, str):
+            return None
+        if name in self.presets:
+            return name
+        return next((n for n, m in self.presets.items() if m.alias == name), None)
+
+    def requested(self, req: web.Request, body: bytes) -> str | None:
+        """The preset a request names in `model` (the JSON body, or ?model= for GET). None for
+        no name or an unknown one: those go to the loaded preset, so clients that send any
+        name keep working. Raises SwapFailed for another preset when autoload is off."""
+        name: object = req.query.get("model")
+        if name is None and b'"model"' in body:
+            with contextlib.suppress(ValueError):
+                doc = json.loads(body)
+                name = doc.get("model") if isinstance(doc, dict) else None
+        preset = self.resolve(name)
+        if preset and not SETTINGS.autoload and preset not in (self.loaded, self.swap and self.swap.target):
+            loaded = self.presets[self.loaded].alias
+            raise SwapFailed(f"model {name} is not loaded ({loaded} is) and autoload is off: `kis use {preset}`")
+        return preset
+
+    async def admit(self, name: str | None) -> int:
+        """Wait until preset `name` (None: whichever is loaded) serves, then count the request
+        in flight on its least busy instance; return that instance's port."""
+        await self.ensure(name)
+        if not self.inflight:
+            raise SwapFailed(self.failure or "no model loaded")
+        port = min(self.inflight, key=lambda p: self.inflight[p])
+        self.inflight[port] += 1
+        return port
+
+    async def ensure(self, name: str | None) -> None:
+        """Return once preset `name` (None: whichever is loaded) serves, starting a swap if
+        needed; raise SwapFailed if loading it fails. While a swap drains and loads, requests
+        for every preset wait, so a busy preset can't keep another one from loading."""
+        while True:
+            swap = self.swap
+            if swap and not (swap.downloading and name in (None, self.loaded)):
+                assert swap.task
+                error = await asyncio.shield(swap.task)
+                if error and swap.target == name:
+                    raise SwapFailed(error)
+            elif name is None or name == self.loaded:
+                return
+            else:
+                self.swap = Swap(name)
+                self.swap.task = asyncio.create_task(self._swap(self.swap))
+
+    async def _swap(self, swap: Swap) -> str | None:
+        """Load swap.target: download it while the loaded preset still serves, wait for the
+        requests in flight, then replace the instances. Return an error, or None."""
+        previous, model, started = self.loaded, self.presets[swap.target], time.time()
+        notify(EventType.MODEL_LOADING, model=model.alias, preset=swap.target, previous=self.presets[previous].alias)
+        stopped = False
+        try:
+            await asyncio.to_thread(self.backends.fetch, swap.target)
+            swap.downloading = False
+            while any(self.inflight.values()):
+                await asyncio.sleep(DRAIN_POLL_S)
+            stopped = True
+            self.inflight = {port: 0 for port in await asyncio.to_thread(self.backends.load, swap.target)}
+            self.loaded = swap.target
+        except Exception as e:
+            log.exception("loading %s failed", swap.target)
+            failed: dict[str, Any] = {"model": model.alias, "preset": swap.target, "error": repr(e)[:2000]}
+            if isinstance(e, BackendsFailed):
+                failed["log"] = e.log
+            notify(EventType.MODEL_FAILED, **failed)
+            if stopped:
+                await self.restore(previous)
+            return f"loading {model.alias} failed: {e}"
+        else:
+            seconds = round(time.time() - started)
+            notify(
+                EventType.MODEL_READY, **{**dump(RUNTIME), "model": model.alias, "preset": swap.target}, seconds=seconds
+            )
+            return None
+        finally:
+            self.swap = None
+
+    async def restore(self, name: str) -> None:
+        """Load preset `name` again after a failed swap; if that fails too, stop the session."""
+        try:
+            self.inflight = {port: 0 for port in await asyncio.to_thread(self.backends.load, name)}
+        except Exception:
+            log.exception("reloading %s failed", name)
+            self.inflight = {}
+            self.failure = f"reloading {self.presets[name].alias} after a failed swap failed"
+            self.stop.set()
+
+    def load(self, model: str) -> web.Response:
+        """POST /admin/load: start swapping to `model` (a preset name or alias)."""
+        name = self.resolve(model)
+        if name is None:
+            return web.json_response(
+                api_error(f"no preset {model!r}; available: {', '.join(self.presets)}"), status=404
+            )
+        self.last_activity = time.time()
+        answer = {"preset": name, "model": self.presets[name].alias, "session": SETTINGS.session}
+        if name == self.loaded and not self.swap:
+            return web.json_response({**answer, "status": ModelStatus.LOADED.value})
+
+        async def load() -> None:
+            with contextlib.suppress(SwapFailed):  # the model_failed event reports it
+                await self.ensure(name)
+
+        task = asyncio.create_task(load())
+        self.loads.add(task)
+        task.add_done_callback(self.loads.discard)
+        return web.json_response({**answer, "status": ModelStatus.LOADING.value}, status=202)
+
+    def status(self, name: str) -> ModelStatus:
+        if self.swap and self.swap.target == name:
+            return ModelStatus.LOADING
+        if name == self.loaded and not self.loading:
+            return ModelStatus.LOADED
+        return ModelStatus.DOWNLOADED if self.backends.downloaded(name) else ModelStatus.AVAILABLE
+
+    def layout(self, name: str) -> dict[str, Any]:
+        """Context and slots of a preset in /v1/models: as running for the loaded one, else as
+        it would start (slots and, with no `topology` in the preset, topology are only known
+        once it runs). `context_length` (OpenRouter's name) is the context each request gets."""
+        if name == RUNTIME.preset and self.status(name) == ModelStatus.LOADED:
+            return {
+                "context_length": RUNTIME.ctx,
+                "parallel": RUNTIME.parallel,
+                "slots": RUNTIME.slots,
+                "topology": RUNTIME.topology,
+            }
+        model = self.presets[name]
+        return {
+            "context_length": model.ctx or SETTINGS.ctx,
+            "parallel": FITTED.get(name, model.parallel),
+            "slots": None,
+            "topology": model.topology,
+        }
+
+    def models(self) -> dict[str, Any]:
+        """/v1/models: every preset of the session, by alias (the name responses report).
+        Beyond OpenAI's id/object/created/owned_by, the fields are kis' own (clients ignore them)."""
+        data = [
+            {
+                "id": model.alias,
+                "object": "model",
+                "created": int(STARTED),
+                "owned_by": "kis",
+                "preset": name,
+                "status": self.status(name).value,
+                **self.layout(name),
+            }
+            for name, model in self.presets.items()
+        ]
+        return {"object": "list", "data": data}
+
+    # ----------------------------------------------------------------------- admin
 
     async def stats(self) -> Stats:
         return Stats(
             session=SETTINGS.session,
-            model=MODEL.alias,
+            model=self.presets[self.loaded].alias,
+            preset=self.loaded,
             topology=RUNTIME.topology,
             slots=RUNTIME.slots,
             parallel=RUNTIME.parallel,
@@ -459,21 +810,20 @@ class Balancer:
         lines = (WORK / name).read_text(errors="replace").splitlines()[-int(req.query.get("lines", 200)) :]
         return web.Response(text="\n".join(lines) + "\n")
 
-    async def forward(self, req: web.Request, url: str) -> tuple[web.StreamResponse, bool, bytearray]:
-        """Proxy one request, streaming the response (SSE included) chunk by chunk; return
-        the response, whether it is SSE, and the tail of its body (for usage stats).
+    async def forward(
+        self, req: web.Request, body: bytes, connect: Callable[[], Awaitable[aiohttp.ClientResponse]]
+    ) -> tuple[web.StreamResponse, bool, bytearray]:
+        """Proxy one request: `connect` waits for a swap if needed and sends the request to an
+        instance. Stream the response (SSE included) chunk by chunk; return it, whether it is
+        SSE, and the tail of its body (for usage stats).
 
         Cloudflare drops requests whose response doesn't start within 100 s (HTTP 524),
-        e.g. a non-streaming completion of a long prompt. If the backend hasn't answered
-        after KEEPALIVE_SECONDS, start a 200 response and send bytes clients ignore
-        (JSON whitespace, SSE comments) until it does.
+        e.g. a non-streaming completion of a long prompt, or one waiting for a swap. If the
+        backend hasn't answered after KEEPALIVE_SECONDS, start a 200 response and send bytes
+        clients ignore (JSON whitespace, SSE comments) until it does.
         """
-        headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
-        body = await req.read()
         sse = b'"stream":true' in body.replace(b" ", b"")
-        assert self.session, "app() not started"
-        request = self.session.request(req.method, url, data=body, headers=headers)
-        pending = asyncio.ensure_future(request.__aenter__())
+        pending = asyncio.ensure_future(connect())
         resp: web.StreamResponse | None = None
         captured = bytearray()
         try:
@@ -483,7 +833,10 @@ class Balancer:
                     resp = web.StreamResponse(headers={"Content-Type": content_type})
                     await resp.prepare(req)
                 await resp.write(b": keepalive\n\n" if sse else b" ")
-            upstream = pending.result()
+            try:
+                upstream = pending.result()
+            except SwapFailed as e:
+                return await self.unavailable(req, resp, sse, str(e)), sse, captured
             if resp is None:
                 resp = web.StreamResponse(
                     status=upstream.status,
@@ -499,12 +852,24 @@ class Balancer:
             pass
         finally:
             if pending.done() and not pending.cancelled() and not pending.exception():
-                await request.__aexit__(None, None, None)
+                await pending.result().__aexit__(None, None, None)
             else:
                 pending.cancel()
         if resp is None:
             raise ConnectionResetError("upstream closed before responding")
         return resp, sse, captured
+
+    @staticmethod
+    async def unavailable(
+        req: web.Request, resp: web.StreamResponse | None, sse: bool, message: str
+    ) -> web.StreamResponse:
+        """A 503 error, or with keepalive bytes already sent, the error as the body of that 200."""
+        error = json.dumps(api_error(message, type="unavailable")).encode()
+        if resp is None:
+            return web.Response(body=error, status=503, content_type="application/json")
+        await resp.write(b"data: " + error + b"\n\n" if sse else error)
+        await resp.write_eof()
+        return resp
 
 
 # --------------------------------------------------------------------------- tunnels
@@ -574,16 +939,18 @@ TUNNELS = {TunnelKind.CLOUDFLARED: cloudflared, TunnelKind.TAILSCALE: tailscale}
 # --------------------------------------------------------------------------- main
 
 
-async def serve(backends: dict[int, subprocess.Popen[bytes]]) -> str:
+async def serve(backends: Backends) -> str:
     """Run the balancer and tunnel until shutdown; return the stop reason."""
-    balancer = Balancer(list(backends), SETTINGS.api_key)
+    balancer = Balancer(backends, SETTINGS.api_key)
     await balancer.start()
     tunnel = SETTINGS.tunnel
 
     def on_ready(url: str) -> None:
-        notify(EventType.READY, endpoint=url, model=MODEL.alias, tunnel=tunnel.kind)
+        notify(EventType.READY, endpoint=url, model=RUNTIME.model, preset=RUNTIME.preset, tunnel=tunnel.kind)
 
     threading.Thread(target=TUNNELS[tunnel.kind], args=(tunnel, on_ready), daemon=True).start()
+    if SETTINGS.prefetch:
+        threading.Thread(target=prefetch, args=(SETTINGS.prefetch,), daemon=True).start()
 
     reason, last_stats = "shutdown requested", time.time()
     while not balancer.stop.is_set():
@@ -595,27 +962,30 @@ async def serve(backends: dict[int, subprocess.Popen[bytes]]) -> str:
             reason = f"idle for {SETTINGS.idle_minutes:g} min"
         elif time.time() - STARTED > SETTINGS.max_hours * 3600:
             reason = "max_hours reached"
-        elif any(proc.poll() is not None for proc in backends.values()):
+        elif not balancer.loading and backends.exited():
             reason = "llama-server exited"
         else:
             continue
         break
     await balancer.close()
-    return reason
+    return balancer.failure or reason
 
 
 def main() -> None:
     setup_logging()
-    notify(EventType.STARTING, model=MODEL.alias)
-    model_path = fetch(MODEL, MODEL.file, MODEL.sha256)
-    draft_path = fetch(MODEL, MODEL.draft_file, MODEL.draft_sha256) if MODEL.draft_file else None
+    notify(EventType.STARTING, model=MODEL.alias, preset=START)
+    backends = Backends()
+    backends.fetch(START)
     notify(EventType.DOWNLOADED)
-    backends = start_backends(model_path, draft_path)
+    try:
+        backends.load(START)
+    except BackendsFailed as e:
+        notify(EventType.ERROR, error=str(e), log=e.log)
+        sys.exit(1)
     try:
         reason = asyncio.run(serve(backends))
     finally:
-        for proc in backends.values():
-            proc.terminate()
+        backends.stop()
     notify(EventType.STOPPED, reason=reason)
 
 

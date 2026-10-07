@@ -45,8 +45,8 @@ async def test_spreads_concurrent_requests_over_instances(aiohttp_client, balanc
 
 async def test_passes_through_backend_routes(aiohttp_client, balancer):
     client = await aiohttp_client(balancer.app())
-    resp = await client.get("/v1/models", headers=AUTH)
-    assert (await resp.json())["data"][0]["id"].startswith("gpu")
+    resp = await client.get("/props", headers=AUTH)
+    assert (await resp.json())["backend"].startswith("gpu")
 
 
 async def test_streams_sse(aiohttp_client, balancer):

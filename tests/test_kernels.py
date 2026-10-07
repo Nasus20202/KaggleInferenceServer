@@ -147,3 +147,19 @@ def test_rendered_scripts_are_self_contained(script, params, config, tmp_path):
     probe = f"import runpy; runpy.run_path({str(path)!r}, run_name='probe')"
     result = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_a_session_can_swap_to_every_preset(config):
+    rendered = load(ServerConfig, rendered_config(config, model="gemma-4-e4b", parallel=3))
+    assert rendered.preset == "gemma-4-e4b" and rendered.models.keys() == config.models.keys()
+    assert rendered.models["gemma-4-e4b"] == rendered.model and rendered.model.parallel == 3  # overrides: start only
+    assert rendered.models["qwen35-9b"] == config.models["qwen35-9b"]
+    assert rendered.autoload
+
+
+def test_prefetch_names_presets(config):
+    config.server = dataclasses.replace(config.server, prefetch=["qwen35-9b", "gemma-4-12b"])
+    assert rendered_config(config)["prefetch"] == ["gemma-4-12b"]  # qwen35-9b is loaded first anyway
+    config.server = dataclasses.replace(config.server, prefetch=["nope"])
+    with pytest.raises(SystemExit, match=r"server\.prefetch"):
+        cli.server_config(up_args(), config, SECRETS)

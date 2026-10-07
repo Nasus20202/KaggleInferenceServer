@@ -5,7 +5,7 @@ import dataclasses
 from http import HTTPStatus
 
 import pytest
-from conftest import SECRETS, fake_llama_server
+from conftest import SECRETS, FakeBackends, fake_llama_server
 
 from kis import events, proxy, rollover, settings
 from kis.client import AdminClient
@@ -64,6 +64,19 @@ def test_rollover_alternates_kernel_slugs(monkeypatch, config):
     assert slugs == ["kis-server-b", "kis-server"]
 
 
+def test_rollover_starts_with_the_loaded_preset(monkeypatch, config):
+    other = Model(repo="r", file="g", alias="g", parallel=2)
+    server = dataclasses.replace(SERVER, preset="m", models={"m": SERVER.model, "g": other})
+    monkeypatch.setattr(events, "current", lambda config, topic: dataclasses.replace(OLD, preset="g"))
+    monkeypatch.setattr(rollover.status, "quota", lambda: None)
+    launched = []
+    monkeypatch.setattr(rollover, "launch", lambda config, server, slug: launched.append(server) or "new")
+    monkeypatch.setattr(rollover, "wait_ready", lambda config, topic, session, since: "https://new")
+    settings.save_state(settings.State(server=server))
+    rollover.rollover(config, "t")
+    assert (launched[0].preset, launched[0].model) == ("g", other)
+
+
 def test_rollover_refuses_without_quota(monkeypatch, config):
     monkeypatch.setattr(events, "current", lambda config, topic: OLD)
     monkeypatch.setattr(rollover.status, "quota", lambda: Quota(used_h=29.9, total_h=30.0))
@@ -80,7 +93,7 @@ def test_rollover_needs_the_settings_of_kis_up(monkeypatch, config):
 
 async def balancer_server(server, aiohttp_server, name: str, delay: float):
     backend = await aiohttp_server(fake_llama_server(name, delay=delay))
-    balancer = server.Balancer([backend.port], api_key="secret")
+    balancer = server.Balancer(FakeBackends({server.START: [backend.port]}, server.START), "secret")
     site = await aiohttp_server(balancer.app())
     return balancer, str(site.make_url("")).rstrip("/")
 
@@ -102,6 +115,18 @@ async def test_retire_leaves_another_session_running(server, aiohttp_server, mon
     await asyncio.to_thread(rollover.retire, url, "secret", "old", 0.3, 0.1, 0.5, grace=0)
     assert not balancer.stop.is_set()
     assert await asyncio.to_thread(AdminClient(url, "secret").shutdown, "old") == HTTPStatus.CONFLICT
+
+
+async def test_admin_client_loads_a_preset(server, aiohttp_server, monkeypatch):
+    monkeypatch.setattr(server.SETTINGS, "session", "s")
+    _, url = await balancer_server(server, aiohttp_server, "s", delay=0)
+    client = AdminClient(url, "secret")
+    code, answer = await asyncio.to_thread(client.load, server.START)
+    assert code == HTTPStatus.OK and answer["status"] == "loaded" and answer["session"] == "s"
+    models = await asyncio.to_thread(client.models)
+    assert [(m["preset"], m["status"]) for m in models] == [(server.START, "loaded")]
+    code, answer = await asyncio.to_thread(client.load, "nope")
+    assert code == HTTPStatus.NOT_FOUND and "available" in answer["error"]["message"]
 
 
 async def test_proxy_switches_sessions_without_failing_a_request(

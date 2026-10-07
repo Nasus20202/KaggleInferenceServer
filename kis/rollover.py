@@ -1,8 +1,9 @@
 """Server sessions: start one, and replace a running one without downtime.
 
 A Kaggle session lasts at most 12 hours. A rollover starts a replacement session
-on the other kernel slug while the old one keeps serving, switches to it once it
-is ready, lets the old one finish its in-flight requests, then shuts it down.
+on the other kernel slug, with the preset the old one has loaded, while the old one
+keeps serving; switches to it once it is ready, lets the old one finish its in-flight
+requests, then shuts it down.
 Sessions are told apart by the id in their events (and in /admin/stats), which
 matters for a named tunnel, where both sessions share one URL.
 """
@@ -120,8 +121,11 @@ def rollover(config: Config, topic: str) -> tuple[events.Session, str]:
     quota = status.quota()
     if quota and quota.left_h < MIN_QUOTA_H:
         raise RolloverError("not enough GPU quota left for a new session")
+    server = state.server
+    if old.preset in server.models:  # start with the preset loaded now, not the one of `kis up`
+        server = dataclasses.replace(server, model=server.models[old.preset], preset=old.preset)
     slug = SLUGS[1] if state.slug == SLUGS[0] else SLUGS[0]
     since = str(int(time.time()))
-    session = launch(config, state.server, slug)
+    session = launch(config, server, slug)
     log.info("rollover: waiting for session %s to replace %s", session, old.session)
     return old, wait_ready(config, topic, session, since)

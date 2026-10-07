@@ -31,6 +31,8 @@ class Server:
     max_queue: int | None = None
     replica_max_gb: float = 11.0
     ctx: int = 32768
+    autoload: bool = True
+    prefetch: list[str] = field(default_factory=list)
     args: list[str] = field(default_factory=list)
 
 
@@ -61,7 +63,7 @@ class State:
     server: ServerConfig | None = None  # settings of the last `kis up`, reused by a rollover
     slug: str = ""  # kernel of the last session
     session: str = ""
-    model: str = ""  # its alias
+    model: str = ""  # alias of its loaded preset
     calibration: dict[str, Calibration] = field(default_factory=dict)  # per preset name
 
 
