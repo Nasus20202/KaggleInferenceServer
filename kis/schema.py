@@ -304,6 +304,15 @@ class GpuStats:
 
 
 @dataclass(frozen=True)
+class CpuStats:
+    """CPU use of the Kaggle container since the previous reading."""
+
+    cores: float  # CPUs the container may use
+    used_pct: int  # of all its cores
+    processes: dict[str, int] = field(default_factory=dict)  # llama-server port -> % of one core
+
+
+@dataclass(frozen=True)
 class RamStats:
     """Host memory of the Kaggle container, where llama-server keeps its prompt cache."""
 
@@ -326,23 +335,27 @@ class UsageSummary:
     draft_acceptance: float | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Stats:
+    """What the server reports, in the order it reads best: the session, its load, then the
+    hardware (GPUs, CPU, RAM)."""
+
     session: str
+    preset: str = ""  # name of the loaded preset
     model: str  # alias of the loaded preset
     topology: Topology
     slots: int  # parallel x instances
     parallel: int  # slots per instance
     ctx: int  # tokens per slot
+    resident: list[str] = field(default_factory=list)  # aliases of the resident presets
     uptime_s: int
     idle_s: int
-    inflight: int
     requests: int
+    inflight: int
     errors: int
     usage: dict[str, UsageSummary]  # per model name
     gpus: list[GpuStats]
-    preset: str = ""  # name of the loaded preset
-    resident: list[str] = field(default_factory=list)  # aliases of the resident presets
+    cpu: CpuStats | None = None
     ram: RamStats | None = None
 
 

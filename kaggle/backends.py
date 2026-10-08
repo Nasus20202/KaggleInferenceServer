@@ -247,7 +247,7 @@ class Backends:
                     tail = (WORK / f"llama-{port}.log").read_text(errors="replace")[-CRASH_LOG_CHARS:]
                 except OSError:
                     tail = ""
-                return {"crashed_port": port, "exit_code": code, "exit": describe_exit(code), "log": tail}
+                return {"exit": describe_exit(code), "exit_code": code, "crashed_port": port, "log": tail}
         return None
 
     def close(self) -> None:

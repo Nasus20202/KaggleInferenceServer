@@ -4,7 +4,7 @@ import dataclasses
 import json
 
 import common
-from kis.schema import Event, EventType, GpuStats, Model, Ntfy, RamStats, Stats, Topology, UsageSummary, dump
+from kis.schema import CpuStats, Event, EventType, GpuStats, Model, Ntfy, RamStats, Stats, Topology, UsageSummary, dump
 
 MODEL = Model(repo="r", file="m.gguf", alias="m", parallel=1, args=["--temp", "1.0"])
 
@@ -115,7 +115,8 @@ def test_a_crash_event_fits_one_ntfy_message_and_names_the_exit(server):
         session="3ae4d5af", model="gemma", topology=Topology.REPLICAS, slots=24, parallel=12, ctx=32768,
         uptime_s=1752, idle_s=0, inflight=8, requests=1537, errors=18, usage={"gemma": usage, "embed": usage},
         gpus=[GpuStats(0, 10053, 15360, 78), GpuStats(1, 0, 15360, 0)], preset="gemma-4-e4b",
-        resident=["embed"], ram=RamStats(9000, 29000, {"8090": 3000, "8091": 3000, "8070": 400}),
+        resident=["embed"], cpu=CpuStats(4.0, 61, {"8090": 170}),
+        ram=RamStats(9000, 29000, {"8090": 3000, "8091": 3000, "8070": 400}),
     )  # fmt: skip
     crash = {"crashed_port": 8091, "exit_code": -9, "exit": "killed by SIGKILL (...)", "log": 'slot "x"\n' * 300}
     extra = {**crash, "ram_before": dump(stats.ram), "ram_peak_mib": 28000}
@@ -126,3 +127,30 @@ def test_a_crash_event_fits_one_ntfy_message_and_names_the_exit(server):
     assert event.data["log"].endswith('slot "x"\n') and event.data["exit_code"] == -9
     note = server.notification(event)
     assert note and "llama-server exited (killed by SIGKILL" in note.message
+
+
+def test_cpu_meter_reports_use_between_two_readings(tmp_path, monkeypatch):
+    cgroup, proc = tmp_path / "cg", tmp_path / "proc"
+    (proc / "42").mkdir(parents=True)
+    cgroup.mkdir()
+    (cgroup / "cpu.max").write_text("200000 100000\n")  # 2 cores
+    clock = {"t": 100.0}
+    monkeypatch.setattr(common, "PROC", proc)
+    monkeypatch.setattr(common, "CGROUP", cgroup)
+    monkeypatch.setattr(common.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(common.os, "sysconf", lambda name: 100)  # clock ticks per second
+
+    def set_cpu(container_s: float, process_ticks: int):
+        (cgroup / "cpu.stat").write_text(f"usage_usec {int(container_s * 1e6)}\nuser_usec 1\n")
+        # pid, (comm with a space), state, then ppid ... utime (field 14) and stime (15)
+        (proc / "42/stat").write_text(f"42 (llama server) S {'0 ' * 10}{process_ticks} 0 0 0 0\n")
+
+    meter = common.CpuMeter()
+    set_cpu(10.0, 1000)
+    assert meter.read({8090: 42}) is None  # one reading is not a rate
+    clock["t"] += 20
+    set_cpu(30.0, 1000 + 3000)  # 20 s later: 20 CPU s of 2 cores x 20 s = 50%; llama used 30 s = 150% of a core
+    assert meter.read({8090: 42}) == CpuStats(cores=2.0, used_pct=50, processes={"8090": 150})
+    clock["t"] += 1
+    set_cpu(31.0, 4100)
+    assert meter.read({8090: 42}) == CpuStats(cores=2.0, used_pct=50, processes={"8090": 150})  # too soon: repeated
