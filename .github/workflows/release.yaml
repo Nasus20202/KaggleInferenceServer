@@ -64,8 +64,6 @@ jobs:
 
       - name: Commit and tag
         run: |
-          git config user.name "Krzysztof Nasuta"
-          git config user.email "krzysztof@nasuta.dev"
           git commit -am "chore(release): v$VERSION"
           git tag -a "v$VERSION" -m "v$VERSION"
           git show --stat HEAD
