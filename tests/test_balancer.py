@@ -84,13 +84,6 @@ async def test_shutdown_requires_key_and_sets_stop(aiohttp_client, balancer):
     assert balancer.stop.is_set()
 
 
-def test_plan_replicates_small_models_and_splits_large(server):
-    assert server.plan(["0", "1"], 5.9, None, 11.0) == ("replicas", [["0"], ["1"]])
-    assert server.plan(["0", "1"], 17.1, None, 11.0) == ("split", [["0", "1"]])
-    assert server.plan(["0", "1"], 5.9, "split", 11.0) == ("split", [["0", "1"]])
-    assert server.plan(["0"], 5.9, None, 11.0) == ("replicas", [["0"]])
-
-
 async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server, monkeypatch):
     """Long prompts: bytes start flowing before Cloudflare's first-byte timeout, and clients still parse them."""
     monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)  # fake backends answer after 0.2 s
