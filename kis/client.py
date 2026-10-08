@@ -10,6 +10,10 @@ from typing import Any
 from . import retry
 from .schema import Route, Stats, load
 
+# urllib's default "Python-urllib/3.x" is blocked with a 403 (error 1010) by Cloudflare's
+# Browser Integrity Check on a proxied hostname, as a named tunnel's is.
+USER_AGENT = "kis (github.com/Nasus20202/KaggleInferenceServer)"
+
 
 class AdminClient:
     """Calls one server endpoint with the API key; transient errors are retried."""
@@ -20,7 +24,9 @@ class AdminClient:
     def _call(self, route: Route, method: str = "GET", **query: str | int) -> tuple[int, bytes]:
         """(HTTP status, body); raises OSError if the server can't be reached."""
         url = f"{self.url}{route}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
-        req = urllib.request.Request(url, method=method, headers={"Authorization": f"Bearer {self.api_key}"})
+        req = urllib.request.Request(
+            url, method=method, headers={"Authorization": f"Bearer {self.api_key}", "User-Agent": USER_AGENT}
+        )
         try:
             with retry.urlopen(req, timeout=self.timeout, what=route) as r:
                 return r.status, r.read()
