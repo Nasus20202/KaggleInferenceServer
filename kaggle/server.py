@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -953,6 +954,43 @@ class Balancer:
 # --------------------------------------------------------------------------- tunnels
 
 
+WATCH_SECONDS = 30  # between probes of the tunnel's public URL
+WATCH_FAILURES = 3  # consecutive failed probes after which the tunnel is restarted
+
+
+def tunnel_alive(url: str, timeout: float = 15) -> bool:
+    """True if `url` reaches this server through the tunnel: GET Route.HEALTH needs no key and does
+    not count as activity. A 5xx from the edge (530 when no tunnel is registered), a DNS failure
+    or a timeout means it does not."""
+    try:
+        urllib.request.urlopen(f"{url}{Route.HEALTH}", timeout=timeout).close()
+    except urllib.error.HTTPError as e:
+        return e.code < 500
+    except OSError:
+        return False
+    return True
+
+
+def watch_tunnel(url: str, proc: subprocess.Popen[str], interval: float = WATCH_SECONDS) -> None:
+    """Kill cloudflared when its public URL stops reaching the balancer, so that the loop in
+    cloudflared() restarts it and announces the new URL. A quick tunnel can lose its registration
+    while the process keeps running, and clients would retry the dead URL until the session ends.
+    Only a tunnel that worked once is watched: where the kernel cannot reach its own public URL,
+    restarting would not help."""
+    reached, failures = False, 0
+    while proc.poll() is None:
+        time.sleep(interval)
+        if tunnel_alive(url):
+            reached, failures = True, 0
+        elif reached:
+            failures += 1
+            log.warning("tunnel %s unreachable (%d/%d)", url, failures, WATCH_FAILURES)
+            if failures >= WATCH_FAILURES:
+                log.error("tunnel %s is down: restarting cloudflared", url)
+                proc.kill()
+                return
+
+
 def cloudflared(tunnel: Tunnel, on_ready: Callable[[str], None]) -> None:
     """Quick tunnel (random trycloudflare.com URL) or, with a token, a named tunnel.
 
@@ -974,6 +1012,7 @@ def cloudflared(tunnel: Tunnel, on_ready: Callable[[str], None]) -> None:
             if url and not announced:
                 announced = True
                 on_ready(url)
+                threading.Thread(target=watch_tunnel, args=(url, proc), daemon=True).start()
         notify(EventType.TUNNEL_RESTART, code=proc.wait())
         time.sleep(5)
 
