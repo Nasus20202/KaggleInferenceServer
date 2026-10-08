@@ -41,8 +41,7 @@ import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import IO, Any, Protocol
+from typing import Any, Protocol
 
 import aiohttp
 from aiohttp import web
@@ -58,13 +57,13 @@ from kis.schema import (  # inlined by `kis`
     ServerConfig,
     Stats,
     Topology,
-    Tunnel,
-    TunnelKind,
     UsageSummary,
     api_error,
     dump,
     load,
 )
+from state import PORT, WORK, log, log_file  # inlined by `kis`
+from tunnels import TUNNELS  # inlined by `kis`
 
 # <params> (replaced by `kis up`; to run by hand in the Kaggle UI, edit the rendered .kis/kis-server/server.py)
 CONFIG = {
@@ -99,15 +98,12 @@ SETTINGS = load(ServerConfig, CONFIG)  # checked and typed; see kis/schema.py fo
 MODEL = SETTINGS.model  # loaded first
 PRESETS = SETTINGS.models or {SETTINGS.preset or MODEL.alias: MODEL}  # name -> preset the session can load
 START = SETTINGS.preset if SETTINGS.preset in PRESETS else next(iter(PRESETS))
-WORK = Path("/kaggle/working")
-PORT = 8080  # balancer; the only port the tunnel exposes
 BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
 RESIDENT_PORT = 8070  # resident presets use RESIDENT_PORT, RESIDENT_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
 STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
 DRAIN_POLL_S = 0.1  # how often a swap checks whether the requests in flight have finished
 STARTED = time.time()
-log = logging.getLogger("kis")
 
 
 @dataclass
@@ -192,18 +188,6 @@ def notification(event: Event) -> Notification | None:
     if event.type == EventType.MODEL_FAILED:
         return Notification(f"{model} failed to load", event.problem[:300], Priority.HIGH, "warning")
     return None
-
-
-def log_file(name: str) -> IO[str]:
-    """Log file for a child process; it stays open for the process lifetime."""
-    return open(WORK / name, "w")
-
-
-def download(url: str, path: str) -> str:
-    if not os.path.exists(path):
-        urllib.request.urlretrieve(url, path)
-        os.chmod(path, 0o755)
-    return path
 
 
 # --------------------------------------------------------------------------- llama-server instances
@@ -951,108 +935,6 @@ class Balancer:
         return resp
 
 
-# --------------------------------------------------------------------------- tunnels
-
-
-WATCH_SECONDS = 30  # between probes of the tunnel's public URL
-WATCH_FAILURES = 3  # consecutive failed probes after which the tunnel is restarted
-
-
-def tunnel_alive(url: str, timeout: float = 15) -> bool:
-    """True if `url` reaches this server through the tunnel: GET Route.HEALTH needs no key and does
-    not count as activity. A 5xx from the edge (530 when no tunnel is registered), a DNS failure
-    or a timeout means it does not."""
-    try:
-        urllib.request.urlopen(f"{url}{Route.HEALTH}", timeout=timeout).close()
-    except urllib.error.HTTPError as e:
-        return e.code < 500
-    except OSError:
-        return False
-    return True
-
-
-def watch_tunnel(url: str, proc: subprocess.Popen[str], interval: float = WATCH_SECONDS) -> None:
-    """Kill cloudflared when its public URL stops reaching the balancer, so that the loop in
-    cloudflared() restarts it and announces the new URL. A quick tunnel can lose its registration
-    while the process keeps running, and clients would retry the dead URL until the session ends.
-    Only a tunnel that worked once is watched: where the kernel cannot reach its own public URL,
-    restarting would not help."""
-    reached, failures = False, 0
-    while proc.poll() is None:
-        time.sleep(interval)
-        if tunnel_alive(url):
-            reached, failures = True, 0
-        elif reached:
-            failures += 1
-            log.warning("tunnel %s unreachable (%d/%d)", url, failures, WATCH_FAILURES)
-            if failures >= WATCH_FAILURES:
-                log.error("tunnel %s is down: restarting cloudflared", url)
-                proc.kill()
-                return
-
-
-def cloudflared(tunnel: Tunnel, on_ready: Callable[[str], None]) -> None:
-    """Quick tunnel (random trycloudflare.com URL) or, with a token, a named tunnel.
-
-    A named tunnel's public hostname must point to http://localhost:8080.
-    Runs forever, restarting the tunnel if it drops.
-    """
-    binary = download(
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "/tmp/cloudflared"
-    )
-    cmd = [binary, "tunnel", "--no-autoupdate", "--protocol", "http2"]
-    cmd += ["run", "--token", tunnel.token] if tunnel.token else ["--url", f"http://127.0.0.1:{PORT}"]
-    while True:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        announced = False
-        for line in proc.stdout or []:
-            log.info("cloudflared: %s", line.rstrip())
-            quick = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-            url = quick.group(0) if quick else (tunnel.public_url if "Registered tunnel connection" in line else None)
-            if url and not announced:
-                announced = True
-                on_ready(url)
-                threading.Thread(target=watch_tunnel, args=(url, proc), daemon=True).start()
-        notify(EventType.TUNNEL_RESTART, code=proc.wait())
-        time.sleep(5)
-
-
-def tailscale(tunnel: Tunnel, on_ready: Callable[[str], None]) -> None:
-    """Join the tailnet in userspace mode; inbound tailnet connections reach localhost:<port>."""
-    root = "/tmp/tailscale"
-    if not os.path.exists(f"{root}/tailscale"):
-        os.makedirs(root, exist_ok=True)
-        subprocess.run(
-            f"curl -fsSL https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz"
-            f" | tar xz -C {root} --strip-components=1",
-            shell=True,
-            check=True,
-        )
-    ts = [f"{root}/tailscale", "--socket=/tmp/tailscaled.sock"]
-    subprocess.Popen(
-        [f"{root}/tailscaled", "--tun=userspace-networking", "--state=mem:", "--socket=/tmp/tailscaled.sock"],
-        stdout=log_file("tailscaled.log"),
-        stderr=subprocess.STDOUT,
-    )
-    time.sleep(3)
-    subprocess.run(
-        [
-            *ts,
-            "up",
-            f"--authkey={tunnel.authkey}",
-            f"--hostname={tunnel.hostname}",
-            "--accept-dns=false",
-        ],
-        check=True,
-        timeout=120,
-    )
-    me = json.loads(subprocess.check_output([*ts, "status", "--json"]))["Self"]
-    on_ready(f"http://{me['DNSName'].rstrip('.') or me['TailscaleIPs'][0]}:{PORT}")
-
-
-TUNNELS = {TunnelKind.CLOUDFLARED: cloudflared, TunnelKind.TAILSCALE: tailscale}
-
-
 # --------------------------------------------------------------------------- main
 
 
@@ -1065,7 +947,7 @@ async def serve(backends: Backends) -> tuple[str, Stats]:
     def on_ready(url: str) -> None:
         notify(EventType.READY, endpoint=url, model=RUNTIME.model, preset=RUNTIME.preset, tunnel=tunnel.kind)
 
-    threading.Thread(target=TUNNELS[tunnel.kind], args=(tunnel, on_ready), daemon=True).start()
+    threading.Thread(target=TUNNELS[tunnel.kind], args=(tunnel, on_ready, notify), daemon=True).start()
     if SETTINGS.prefetch:
         threading.Thread(target=prefetch, args=(SETTINGS.prefetch,), daemon=True).start()
 
