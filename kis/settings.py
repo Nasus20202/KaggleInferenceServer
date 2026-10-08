@@ -33,6 +33,7 @@ class Server:
     max_hours: float = 11.5
     rollover_hours: float = 0  # 0 = off
     max_queue: int | None = None
+    sticky_slack: int = 4  # -1 = always the least busy replica
     replica_max_gb: float = 11.0
     ctx: int = 32768
     autoload: bool = True

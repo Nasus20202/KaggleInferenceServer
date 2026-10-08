@@ -153,3 +153,73 @@ async def test_max_queue_answers_429_when_full(aiohttp_client, balancer, server,
     monkeypatch.setattr(server.SETTINGS, "max_queue", None)
     resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
     assert {r.status for r in resps} == {200}
+
+
+def chat(*messages, tools=None):
+    return json.dumps({"model": "m", "messages": list(messages), "tools": tools or []}).encode()
+
+
+SYSTEM = {"role": "system", "content": "You fix clusters."}
+
+
+def test_affinity_key_is_the_same_for_every_turn_of_a_conversation():
+    first = {"role": "user", "content": "pod is pending"}
+    turn1 = chat(SYSTEM, first)
+    turn2 = chat(
+        SYSTEM, first, {"role": "assistant", "content": "kubectl get pods"}, {"role": "tool", "content": "..."}
+    )
+    assert balancer_mod.affinity_key(turn1) == balancer_mod.affinity_key(turn2) is not None
+
+
+def test_affinity_key_differs_between_conversations_and_tool_sets():
+    a = balancer_mod.affinity_key(chat(SYSTEM, {"role": "user", "content": "pod is pending"}))
+    b = balancer_mod.affinity_key(chat(SYSTEM, {"role": "user", "content": "service has no endpoints"}))
+    c = balancer_mod.affinity_key(chat(SYSTEM, {"role": "user", "content": "pod is pending"}, tools=[{"x": 1}]))
+    assert len({a, b, c}) == 3
+
+
+def test_affinity_key_needs_a_chat_or_prompt():
+    assert balancer_mod.affinity_key(b"not json {") is None
+    assert balancer_mod.affinity_key(b'{"input": "embed me"}') is None
+    assert balancer_mod.affinity_key(b'{"messages": 3}') is None
+    assert balancer_mod.affinity_key(b'{"prompt": "abc"}') == balancer_mod.affinity_key(b'{"prompt": "abc"}')
+
+
+def test_pick_prefers_the_hashed_instance_until_the_load_differs_too_much():
+    key = "1"  # odd: the second of two ports
+    assert balancer_mod.pick({8090: 0, 8091: 0}, key, 4) == 8091
+    assert balancer_mod.pick({8090: 0, 8091: 4}, key, 4) == 8091  # within the slack
+    assert balancer_mod.pick({8090: 0, 8091: 5}, key, 4) == 8090  # the load wins
+    assert balancer_mod.pick({8090: 0, 8091: 0}, key, -1) == 8090  # off: least busy (the first on a tie)
+    assert balancer_mod.pick({8090: 3, 8091: 0}, None, 4) == 8091  # no key: least busy
+    assert balancer_mod.pick({8090: 7}, key, 4) == 8090  # one instance
+
+
+async def test_turns_of_one_conversation_reach_the_same_instance(aiohttp_client, balancer):
+    client = await aiohttp_client(balancer.app())
+
+    async def turn(*messages):
+        resp = await client.post("/v1/chat/completions", data=chat(*messages), headers=AUTH)
+        return (await resp.json())["backend"]
+
+    history = [SYSTEM, {"role": "user", "content": "pod is pending"}]
+    seen = set()
+    for i in range(4):
+        seen.add(await turn(*history))
+        history += [{"role": "assistant", "content": f"step {i}"}, {"role": "tool", "content": "ok"}]
+    assert len(seen) == 1
+    others = {await turn(SYSTEM, {"role": "user", "content": f"task {i}"}) for i in range(8)}
+    assert others == {"gpu0", "gpu1"}  # other conversations spread over both
+
+
+async def test_sticky_routing_can_be_turned_off(aiohttp_client, balancer, server, monkeypatch):
+    monkeypatch.setattr(server.SETTINGS, "sticky_slack", -1)
+    client = await aiohttp_client(balancer.app())
+
+    async def one():
+        resp = await client.post(
+            "/v1/chat/completions", data=chat(SYSTEM, {"role": "user", "content": "same"}), headers=AUTH
+        )
+        return (await resp.json())["backend"]
+
+    assert sorted(await asyncio.gather(*(one() for _ in range(6)))) == ["gpu0"] * 3 + ["gpu1"] * 3
