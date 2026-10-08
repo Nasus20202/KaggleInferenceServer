@@ -73,11 +73,11 @@ args = [
   "--reasoning-budget", "4096",
   "--batch-size", "2048",
   "--ubatch-size", "512",
-  # Host RAM (MiB) each llama-server may use for its prompt cache. Kaggle gives ~30 GiB of RAM;
-  # a server holds ~6 GiB besides the cache and 2 replicas run at once, so llama.cpp's default
-  # of 8192 filled it and the kernel killed a server after 25-50 min of load. Keep
-  # 2 x (6 GiB + this) + ~4 GiB well under 30 GiB.
-  "--cache-ram", "4096",
+  # Host RAM (MiB) each llama-server may use for its prompt cache. Kaggle gives ~30 GiB of RAM
+  # and 2 replicas run at once. llama.cpp's default of 8192 filled it: the kernel killed a
+  # server after 25-50 min of load. Measured with 32 slots on gemma-4-e4b: 3072 held 22 GiB
+  # for 68 min, 4096 reached 28.6 GiB after 71 min. Each GiB here costs about 2 GiB of RAM.
+  "--cache-ram", "3072",
   "--metrics",
 ]
 
