@@ -8,8 +8,9 @@ import asyncio
 import hmac
 import logging
 import os
+import signal
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 import aiohttp
@@ -42,9 +43,24 @@ class Retryable(Exception):
     """A transient upstream status (502 while the tunnel reconnects, 524, ...)."""
 
 
+TUNNEL_DOWN = 530  # Cloudflare: no tunnel is registered for the hostname
+
+
 @dataclass
 class Upstream:
     url: str | None  # base URL of the current Kaggle server
+    down_since: float | None = None  # when requests started failing with no success since
+
+    def reached(self, ok: bool) -> None:
+        """Record one request's outcome: the first failure starts the clock, a success stops it."""
+        if ok:
+            self.down_since = None
+        elif self.down_since is None:
+            self.down_since = time.time()
+
+
+def stop_process() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def run(config: Config, secrets: Secrets, host: str, port: int) -> None:
@@ -58,12 +74,19 @@ def authorized(req: web.Request, key: str) -> bool:
 
 
 def make_app(
-    config: Config, secrets: Secrets, refresh_seconds: float = 15, rollover_check_seconds: float = 60
+    config: Config,
+    secrets: Secrets,
+    refresh_seconds: float = 15,
+    rollover_check_seconds: float = 60,
+    give_up: Callable[[], None] = stop_process,
 ) -> web.Application:
     """Without KIS_PROXY_API_KEY any client may use the proxy (it listens on localhost by
     default); with it, clients must send that key. With server.rollover_hours set, the
-    proxy replaces a session that old with a fresh one, without downtime."""
+    proxy replaces a session that old with a fresh one, without downtime. With
+    KIS_PROXY_GIVE_UP_MINUTES set, it stops (calling `give_up`) once the server has been
+    unreachable for that long, so that clients fail fast instead of retrying a dead tunnel."""
     local_key = os.environ.get("KIS_PROXY_API_KEY", "")
+    give_up_s = float(os.environ.get("KIS_PROXY_GIVE_UP_MINUTES") or 0) * 60
     if local_key:
         log.info("clients must send KIS_PROXY_API_KEY")
     topic = secrets.ntfy_topic
@@ -77,6 +100,14 @@ def make_app(
             if url != upstream.url:
                 log.info("upstream: %s", url or "none (server stopped)")
                 upstream.url = url
+
+    async def watch_upstream() -> None:
+        while True:
+            await asyncio.sleep(min(30, give_up_s / 4))
+            if upstream.down_since is not None and time.time() - upstream.down_since >= give_up_s:
+                log.error("Kaggle server unreachable for %.0f min: stopping the proxy", give_up_s / 60)
+                give_up()
+                return
 
     def idle_seconds(session: events.Session) -> float:
         if not session.endpoint:
@@ -121,10 +152,12 @@ def make_app(
                 try:
                     resp = await forward(req, f"{upstream.url}{req.rel_url}", headers, retry_status=not last)
                     status = resp.status
+                    upstream.reached(status != TUNNEL_DOWN)
                     return resp
                 except (aiohttp.ClientConnectionError, TimeoutError, Retryable) as e:
                     if last:
                         log.warning("Kaggle server unreachable: %s", e)
+                        upstream.reached(False)
                         status = 502
                         return web.json_response(api_error(f"Kaggle server unreachable: {e}"), status=502)
                     delay = retry.backoff(attempt)
@@ -167,6 +200,9 @@ def make_app(
     async def lifecycle(app: web.Application) -> AsyncIterator[None]:
         app[CLIENT] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=20))
         tasks = [asyncio.create_task(follow_endpoint())]
+        if give_up_s:
+            log.info("stopping after %.0f min without a reachable server", give_up_s / 60)
+            tasks.append(asyncio.create_task(watch_upstream()))
         if hours := config.server.rollover_hours:
             log.info("rollover after %.1f h per session", hours)
             tasks.append(asyncio.create_task(auto_rollover(hours)))
