@@ -7,10 +7,11 @@ import pytest
 from aiohttp import web
 from conftest import SECRETS
 
+import tunnels
 from kis import events, proxy
 
 
-async def test_tunnel_alive_by_health_status(aiohttp_server, server):
+async def test_tunnel_alive_by_health_status(aiohttp_server):
     async def health(req: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
@@ -23,12 +24,12 @@ async def test_tunnel_alive_by_health_status(aiohttp_server, server):
     down.router.add_get("/health", edge_error)
     up_url = str((await aiohttp_server(up)).make_url("")).rstrip("/")
     down_url = str((await aiohttp_server(down)).make_url("")).rstrip("/")
-    assert await asyncio.to_thread(server.tunnel_alive, up_url)
-    assert not await asyncio.to_thread(server.tunnel_alive, down_url)
+    assert await asyncio.to_thread(tunnels.tunnel_alive, up_url)
+    assert not await asyncio.to_thread(tunnels.tunnel_alive, down_url)
 
 
-def test_tunnel_alive_is_false_without_a_host(server):
-    assert not server.tunnel_alive("http://127.0.0.1:1", timeout=1)
+def test_tunnel_alive_is_false_without_a_host():
+    assert not tunnels.tunnel_alive("http://127.0.0.1:1", timeout=1)
 
 
 class FakeProc:
@@ -42,7 +43,7 @@ class FakeProc:
         self.killed.set()
 
 
-def watch(server, monkeypatch, probes: list[bool]) -> FakeProc:
+def watch(monkeypatch, probes: list[bool]) -> FakeProc:
     """Run watch_tunnel through `probes`; a probe past the list ends the proc."""
     proc, results = FakeProc(), iter(probes)
 
@@ -53,18 +54,18 @@ def watch(server, monkeypatch, probes: list[bool]) -> FakeProc:
             proc.killed.set()
             return True
 
-    monkeypatch.setattr(server, "tunnel_alive", alive)
-    server.watch_tunnel("https://t.example", proc, interval=0)
+    monkeypatch.setattr(tunnels, "tunnel_alive", alive)
+    tunnels.watch_tunnel("https://t.example", proc, interval=0)  # type: ignore[arg-type]
     return proc
 
 
-def test_kills_cloudflared_after_consecutive_failures(server, monkeypatch):
-    proc = watch(server, monkeypatch, [True, False, False, False, True])
+def test_kills_cloudflared_after_consecutive_failures(monkeypatch):
+    proc = watch(monkeypatch, [True, False, False, False, True])
     assert proc.killed.is_set()
     assert proc.poll() == -9
 
 
-def test_a_recovered_probe_resets_the_count(server, monkeypatch):
+def test_a_recovered_probe_resets_the_count(monkeypatch):
     killed = []
     proc = FakeProc()
     proc.kill = lambda: killed.append(1)  # type: ignore[method-assign]
@@ -79,12 +80,12 @@ def test_a_recovered_probe_resets_the_count(server, monkeypatch):
             proc.poll = lambda: 0  # type: ignore[method-assign]
             return True
 
-    monkeypatch.setattr(server, "tunnel_alive", alive)
-    server.watch_tunnel("https://t.example", proc, interval=0)  # type: ignore[arg-type]
+    monkeypatch.setattr(tunnels, "tunnel_alive", alive)
+    tunnels.watch_tunnel("https://t.example", proc, interval=0)  # type: ignore[arg-type]
     assert ended and not killed
 
 
-def test_a_tunnel_that_never_worked_is_left_alone(server, monkeypatch):
+def test_a_tunnel_that_never_worked_is_left_alone(monkeypatch):
     killed = []
     proc = FakeProc()
     proc.kill = lambda: killed.append(1)  # type: ignore[method-assign]
@@ -97,8 +98,8 @@ def test_a_tunnel_that_never_worked_is_left_alone(server, monkeypatch):
             proc.poll = lambda: 0  # type: ignore[method-assign]
             return False
 
-    monkeypatch.setattr(server, "tunnel_alive", alive)
-    server.watch_tunnel("https://t.example", proc, interval=0)  # type: ignore[arg-type]
+    monkeypatch.setattr(tunnels, "tunnel_alive", alive)
+    tunnels.watch_tunnel("https://t.example", proc, interval=0)  # type: ignore[arg-type]
     assert not killed
 
 

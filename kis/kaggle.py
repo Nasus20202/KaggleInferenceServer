@@ -37,7 +37,12 @@ class KernelState(enum.StrEnum):
 
 
 # Modules a Kaggle script imports, pasted into it when it is pushed (Kaggle runs a single file).
-INLINED = {"common": ROOT / "kaggle" / "common.py", "kis.schema": ROOT / "kis" / "schema.py"}
+INLINED = {
+    "common": ROOT / "kaggle" / "common.py",
+    "kis.schema": ROOT / "kis" / "schema.py",
+    "state": ROOT / "kaggle" / "state.py",
+    "tunnels": ROOT / "kaggle" / "tunnels.py",
+}
 INLINED_IMPORT = re.compile(r"^from (" + "|".join(map(re.escape, INLINED)) + r") import (?:\([^)]*\)|.*)$", re.M)
 
 
