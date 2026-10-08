@@ -281,8 +281,8 @@ def cmd_logs(args: argparse.Namespace, config: Config) -> None:
         sys.exit("no running server")
     try:
         print(AdminClient(url, secrets.api_key, timeout=60).logs(args.file, args.lines), end="")
-    except RuntimeError as e:
-        sys.exit(str(e))
+    except (RuntimeError, OSError) as e:  # an error answer, or the server can't be reached
+        sys.exit(f"cannot read {args.file} from {url}: {e}")
 
 
 def cmd_status(args: argparse.Namespace, config: Config) -> None:

@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from kis import status
 from kis.schema import Stats, load
 
@@ -71,3 +73,22 @@ def test_format_models_shows_slots_and_context():
         "* a  A  loaded  8 slots x 64K",
         "  b  B  available  9 per instance x 32K",
     ]
+
+
+def test_logs_file_says_why_the_server_cannot_be_read(monkeypatch, capsys):
+    import argparse
+
+    from conftest import SECRETS
+
+    from kis import cli, events
+    from kis.client import AdminClient
+
+    def unreachable(self, file, lines):
+        raise OSError("certificate verify failed")
+
+    monkeypatch.setattr(cli, "load_secrets", lambda: SECRETS)
+    monkeypatch.setattr(events, "endpoint", lambda config, topic: "https://llm.example.com")
+    monkeypatch.setattr(AdminClient, "logs", unreachable)
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_logs(argparse.Namespace(file="server.log", lines=3, since="1h"), None)  # type: ignore[arg-type]
+    assert "cannot read server.log from https://llm.example.com: certificate verify failed" in str(e.value)
