@@ -85,3 +85,31 @@ def test_plan_replicates_small_models_and_splits_large():
     assert backends.plan(["0", "1"], 17.1, None, 11.0) == ("split", [["0", "1"]])
     assert backends.plan(["0", "1"], 5.9, Topology.SPLIT, 11.0) == ("split", [["0", "1"]])
     assert backends.plan(["0"], 5.9, None, 11.0) == ("replicas", [["0"]])
+
+
+def test_describe_exit():
+    assert backends.describe_exit(1) == "exited with code 1"
+    assert backends.describe_exit(-11) == "killed by SIGSEGV"
+    assert "OOM killer" in backends.describe_exit(-9)
+
+
+def test_crash_names_the_exited_process_and_keeps_the_log_tail(monkeypatch, tmp_path):
+    class Exited(FakeProc):
+        def __init__(self, code):
+            super().__init__(1)
+            self.code = code
+
+        def poll(self):
+            return self.code
+
+    monkeypatch.setattr(backends, "WORK", tmp_path)
+    (tmp_path / "llama-8091.log").write_text("x" * 5000 + "slot 3 released")
+    live = backends.Backends.__new__(backends.Backends)
+    live.procs = {8090: Exited(None), 8091: Exited(-9)}  # type: ignore[assignment]
+    live.residents, live.resident_procs = {}, []
+    crash = live.crash()
+    assert crash and crash["crashed_port"] == 8091 and crash["exit_code"] == -9
+    assert "OOM killer" in str(crash["exit"])
+    assert str(crash["log"]).endswith("slot 3 released") and len(str(crash["log"])) == 3000
+    live.procs = {8090: Exited(None)}  # type: ignore[assignment]
+    assert live.crash() is None

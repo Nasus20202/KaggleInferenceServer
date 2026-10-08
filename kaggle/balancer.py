@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import web
 
 from backends import FITTED, BackendsFailed  # inlined by `kis`
-from common import gpu_stats  # inlined by `kis`
+from common import gpu_stats, ram_stats  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     EventType,
@@ -43,6 +43,8 @@ class BackendSet(Protocol):
 
     @property
     def ports(self) -> list[int]: ...
+    @property
+    def pids(self) -> dict[int, int]: ...
     def fetch(self, name: str) -> None: ...
     def downloaded(self, name: str) -> bool: ...
     def load(self, name: str) -> list[int]: ...
@@ -528,6 +530,7 @@ class Balancer:
             errors=self.errors,
             usage={model: u.summary() for model, u in self.usage.items()},
             gpus=await asyncio.to_thread(gpu_stats),
+            ram=await asyncio.to_thread(ram_stats, self.backends.pids),
             resident=[self.presets[name].alias for name in self.residents],
         )
 

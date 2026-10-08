@@ -6,6 +6,7 @@ Calibration measures what the server will run because both build the
 llama-server command here.
 """
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -15,8 +16,9 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from kis.schema import Event, GpuStats, Model, Ntfy
+from kis.schema import Event, GpuStats, Model, Ntfy, RamStats
 
+CGROUP, PROC = Path("/sys/fs/cgroup"), Path("/proc")  # the container's memory accounting, and the processes
 MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
 NTFY_MESSAGE_BYTES = 4096  # ntfy.sh's limit; a longer message becomes an attachment, which kis can't read
 
@@ -64,6 +66,14 @@ def fetch(model: Model, file: str, sha256: str | None = None) -> str:
     return path
 
 
+def fit_message(event: Event) -> Event:
+    """`event` with the start of its `log` text cut until its message fits one ntfy message."""
+    while len(event_message(event).encode()) > NTFY_MESSAGE_BYTES and event.data.get("log"):
+        log = event.data["log"]
+        event = dataclasses.replace(event, data={**event.data, "log": log[len(log) // 4 + 1 :]})
+    return event
+
+
 def gpu_stats() -> list[GpuStats]:
     """Memory (MiB) and utilization (%) of each GPU; empty if nvidia-smi fails."""
     try:
@@ -84,6 +94,73 @@ def gpu_stats() -> list[GpuStats]:
         gpu, used, total, util = map(int, line.split(", "))
         stats.append(GpuStats(gpu=gpu, used_mib=used, total_mib=total, util_pct=util))
     return stats
+
+
+MIB = 1 << 20
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def _field(text: str | None, name: str) -> int | None:
+    """The number after `name` in a "name value" line, or None."""
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[0].rstrip(":") == name and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def host_memory() -> tuple[int, int] | None:
+    """(used, total) MiB of the container: its cgroup (v2, then v1) if it has a limit, else the
+    machine's /proc/meminfo. Used leaves out the reclaimable page cache, like `docker stats`."""
+    meminfo = _read(PROC / "meminfo")
+    machine = _field(meminfo, "MemTotal")
+    available = _field(meminfo, "MemAvailable")
+    candidates = [  # (usage file, limit file, memory.stat file, its inactive-file key); all in bytes
+        (CGROUP / "memory.current", CGROUP / "memory.max", CGROUP / "memory.stat", "inactive_file"),
+        (
+            CGROUP / "memory/memory.usage_in_bytes",
+            CGROUP / "memory/memory.limit_in_bytes",
+            CGROUP / "memory/memory.stat",
+            "total_inactive_file",
+        ),
+    ]
+    for usage_file, limit_file, stat_file, inactive_key in candidates:
+        usage = _read(usage_file)
+        if usage is None or not usage.strip().isdigit():
+            continue
+        used = int(usage) - (_field(_read(stat_file), inactive_key) or 0)
+        limit = (_read(limit_file) or "").strip()
+        total = int(limit) // MIB if limit.isdigit() else None  # "max" = unlimited
+        if machine and (total is None or total > machine // 1024):
+            total = machine // 1024
+        if total:
+            return max(used, 0) // MIB, total
+    if machine and available is not None:
+        return (machine - available) // 1024, machine // 1024
+    return None
+
+
+def process_memory(pid: int) -> int | None:
+    """Anonymous resident memory (MiB) of a process: the heap and the prompt cache, not the
+    memory-mapped model file; None if it is gone."""
+    status = _read(PROC / str(pid) / "status")
+    kib = _field(status, "RssAnon")
+    return None if kib is None else kib // 1024
+
+
+def ram_stats(pids: dict[int, int]) -> RamStats | None:
+    """Host memory plus the anonymous memory of the llama-servers `pids` (port -> pid)."""
+    memory = host_memory()
+    if memory is None:
+        return None
+    sizes = {str(port): process_memory(pid) for port, pid in pids.items()}
+    return RamStats(memory[0], memory[1], {port: mib for port, mib in sizes.items() if mib is not None})
 
 
 def llama_command(

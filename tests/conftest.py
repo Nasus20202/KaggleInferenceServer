@@ -88,6 +88,10 @@ class FakeBackends:
     def ports(self) -> list[int]:
         return self.by_preset[self.loaded]
 
+    @property
+    def pids(self) -> dict[int, int]:
+        return {}
+
     def fetch(self, name: str) -> None:
         time.sleep(self.fetch_s)
         self.fetched.append(name)

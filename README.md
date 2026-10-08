@@ -130,6 +130,7 @@ model: Qwen3.5-9B-Q4_K_M (qwen35-9b)  replicas, 4 slots x 114688 tokens
 requests: 12 (0 errors), 1 in flight, up 25 min, idle 0 min
 GPU0: 13.6 / 15.0 GiB VRAM, 87% busy
 GPU1: 13.6 / 15.0 GiB VRAM, 64% busy
+RAM: 11.2 / 29.0 GiB (llama-server :8090 3.4 GiB, llama-server :8091 3.3 GiB)
 ```
 
 `kis up` also prints the quota before it starts a session. `kis status` also shows the token totals per model (see below).
@@ -169,9 +170,12 @@ The Kaggle kernel publishes there and `kis` reads from there, so the server must
   "usage": {"Qwen3.5-4B-Q4_K_M": {
     "requests": 11, "tokens_in": 52310, "tokens_out": 8120, "tokens_cached": 41870, "cache_rate": 0.8,
     "prefill_tps": 1450.2, "decode_tps": 68.4, "draft_acceptance": 0.71}},
-  "gpus": [{"gpu": 0, "used_mib": 12711, "total_mib": 15360, "util_pct": 87}, {"gpu": 1, "...": "..."}]
+  "gpus": [{"gpu": 0, "used_mib": 12711, "total_mib": 15360, "util_pct": 87}, {"gpu": 1, "...": "..."}],
+  "ram": {"used_mib": 11468, "total_mib": 29696, "processes": {"8090": 3481, "8091": 3380}}
 }
 ```
+
+`ram` is the host memory of the Kaggle container, without the page cache: `processes` has each llama-server's anonymous memory (by port, in MiB), where its prompt cache lives, not the memory-mapped model. The server samples it every 20 s.
 
 In `usage`:
 - **Tokens:** `tokens_in` counts every prompt token, and `tokens_cached` the ones served from llama.cpp's prompt cache; `cache_rate` = cached / in.
@@ -181,7 +185,7 @@ In `usage`:
 `GET /admin/logs?file=server.log&lines=200` returns a log file (`kis logs --file`). `POST /admin/load?model=<preset>` starts a swap and answers 202 at once (`kis use` then follows the events).
 
 The places to look:
-- **Events:** start, ready, errors, a stats heartbeat every 10 min, and the final stats with `stopped`. `kis logs` follows them.
+- **Events:** start, ready, errors, a stats heartbeat every 10 min, and the final stats with `stopped`. `kis logs` follows them. If a llama-server dies, `stopped` also has `exit` and `exit_code` (a kill by the kernel's OOM killer shows as SIGKILL), `crashed_port`, `log` (the end of its output) and `ram_before` / `ram_peak_mib` (host memory at the last 20 s check and its peak).
 - **Server log:** timestamped, one line per request: backend, status, duration, tokens in/cached/out, prefill and decode speed, draft acceptance. `kis logs --file server.log` prints it; it's also in the Kaggle kernel log.
 - **llama-server output:** `kis logs --file llama-8090.log` (`llama-8091.log` for the second replica).
 - **Local:** `kis proxy` logs each request and endpoint changes. `-v` or `KIS_LOG_LEVEL=DEBUG` adds more detail.
