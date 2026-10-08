@@ -25,7 +25,7 @@ ignore = ["ANN401"]  # Any is fine for parsed JSON
 "tests/*" = ["ANN"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["kis", "common", "state", "tunnels"]
+known-first-party = ["kis", "common", "backends", "state", "tunnels"]
 
 [tool.pyright]
 include = ["kis", "kaggle", "tests"]

@@ -28,17 +28,12 @@ import asyncio
 import contextlib
 import dataclasses
 import enum
-import functools
 import json
 import logging
-import os
 import re
-import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -46,7 +41,8 @@ from typing import Any, Protocol
 import aiohttp
 from aiohttp import web
 
-from common import fetch, gpu_stats, llama_command, llama_server_binary, publish  # inlined by `kis`
+from backends import FITTED, Backends, BackendsFailed, prefetch  # inlined by `kis`
+from common import gpu_stats, publish  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     Event,
@@ -56,13 +52,12 @@ from kis.schema import (  # inlined by `kis`
     Route,
     ServerConfig,
     Stats,
-    Topology,
     UsageSummary,
     api_error,
     dump,
     load,
 )
-from state import PORT, WORK, log, log_file  # inlined by `kis`
+from state import PORT, WORK, Runtime, log  # inlined by `kis`
 from tunnels import TUNNELS  # inlined by `kis`
 
 # <params> (replaced by `kis up`; to run by hand in the Kaggle UI, edit the rendered .kis/kis-server/server.py)
@@ -98,24 +93,10 @@ SETTINGS = load(ServerConfig, CONFIG)  # checked and typed; see kis/schema.py fo
 MODEL = SETTINGS.model  # loaded first
 PRESETS = SETTINGS.models or {SETTINGS.preset or MODEL.alias: MODEL}  # name -> preset the session can load
 START = SETTINGS.preset if SETTINGS.preset in PRESETS else next(iter(PRESETS))
-BACKEND_PORT = 8090  # llama-server instances use BACKEND_PORT, BACKEND_PORT + 1, ...
-RESIDENT_PORT = 8070  # resident presets use RESIDENT_PORT, RESIDENT_PORT + 1, ...
 KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
 STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
 DRAIN_POLL_S = 0.1  # how often a swap checks whether the requests in flight have finished
 STARTED = time.time()
-
-
-@dataclass
-class Runtime:
-    """The loaded preset and the layout of its backends."""
-
-    preset: str = ""
-    model: str = ""  # its alias
-    topology: Topology = Topology.REPLICAS
-    slots: int = 0  # parallel x instances
-    parallel: int = 0  # slots per instance
-    ctx: int = 0  # tokens per slot
 
 
 RUNTIME = Runtime()
@@ -190,141 +171,7 @@ def notification(event: Event) -> Notification | None:
     return None
 
 
-# --------------------------------------------------------------------------- llama-server instances
-
-
-FETCHED: dict[str, str] = {}  # repo@revision/file -> local path, downloaded and checked this session
-FETCH_LOCKS: dict[str, threading.Lock] = {}  # one download of a file at a time (prefetch and swaps)
-
-
-def _file_key(model: Model, file: str) -> str:
-    return f"{model.repo}@{model.revision}/{file}"
-
-
-def _fetch_once(model: Model, file: str, sha256: str | None) -> str:
-    key = _file_key(model, file)
-    with FETCH_LOCKS.setdefault(key, threading.Lock()):
-        if key not in FETCHED:
-            FETCHED[key] = fetch(model, file, sha256)
-        return FETCHED[key]
-
-
-def model_files(model: Model) -> tuple[str, str | None]:
-    """Local paths of a preset's model and draft. Each file is downloaded and its sha256
-    checked once per session: hashing the 27B again would add a minute to every swap."""
-    draft = _fetch_once(model, model.draft_file, model.draft_sha256) if model.draft_file else None
-    return _fetch_once(model, model.file, model.sha256), draft
-
-
-def downloaded(model: Model) -> bool:
-    files = [model.file] + ([model.draft_file] if model.draft_file else [])
-    return all(_file_key(model, f) in FETCHED for f in files)
-
-
-def prefetch(names: list[str]) -> None:
-    """Download presets in the background, so swapping to them only has to load them."""
-    for name in names:
-        try:
-            model_files(PRESETS[name])
-            log.info("prefetched %s", name)
-        except Exception:
-            log.exception("prefetch of %s failed", name)
-
-
-server_binary = functools.cache(llama_server_binary)
-
-
-def launch(
-    binary: str,
-    model: Model,
-    paths: tuple[str, str | None],
-    port: int,
-    gpu_ids: list[str],
-    parallel: int,
-    ctx: int,
-) -> subprocess.Popen[bytes]:
-    """One llama-server with `parallel` slots of `ctx` tokens each (KV pool = parallel x ctx)."""
-    cmd, env = llama_command(binary, model, paths, port, gpu_ids, parallel, ctx, SETTINGS.args)
-    return subprocess.Popen(cmd, env=env, stdout=log_file(f"llama-{port}.log"), stderr=subprocess.STDOUT)
-
-
-def wait_healthy(port: int, proc: subprocess.Popen[bytes], timeout: float = 900) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline and proc.poll() is None:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5):
-                return True
-        except OSError:  # connection refused, or 503 while the model loads
-            time.sleep(3)
-    return False
-
-
-def plan(
-    gpus: list[str], size_gb: float, topology: Topology | None, replica_max_gb: float
-) -> tuple[Topology, list[list[str]]]:
-    """Choose replicas (one instance per GPU) or split (one instance on all GPUs); return GPU groups."""
-    chosen = topology or (Topology.REPLICAS if size_gb <= replica_max_gb else Topology.SPLIT)
-    return chosen, [[g] for g in gpus] if chosen == Topology.REPLICAS else [gpus]
-
-
-OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
-FITTED: dict[str, int] = {}  # preset -> slots per instance that fit, so loading it again skips the retries
-
-
-class BackendsFailed(RuntimeError):
-    """llama-server didn't start; `log` is the tail of its output."""
-
-    def __init__(self, message: str, log: str) -> None:
-        super().__init__(message)
-        self.log = log
-
-
-def start_backends(name: str) -> dict[int, subprocess.Popen[bytes]]:
-    """Start one llama-server per GPU group for preset `name`. The context per slot is
-    fixed; if the KV pool doesn't fit, retry with fewer slots."""
-    model = PRESETS[name]
-    paths = model_files(model)
-    binary = server_binary()
-    gpus = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], text=True).split()
-    size_gb = sum(os.path.getsize(p) for p in paths if p) / 1e9
-    topology, groups = plan(gpus, size_gb, model.topology, SETTINGS.replica_max_gb)
-    parallel, ctx = FITTED.get(name, model.parallel), model.ctx or SETTINGS.ctx
-
-    ports = range(BACKEND_PORT, BACKEND_PORT + len(groups))
-    while True:
-        backends = {
-            port: launch(binary, model, paths, port, g, parallel, ctx) for port, g in zip(ports, groups, strict=True)
-        }
-        failed = next((port for port, proc in backends.items() if not wait_healthy(port, proc)), None)
-        if failed is None:
-            break
-        for proc in backends.values():
-            proc.terminate()
-            proc.wait()
-        tail = (WORK / f"llama-{failed}.log").read_text()[-3000:]
-        if OOM.search(tail) and parallel > 1:
-            parallel -= max(1, parallel // 4)
-            notify(EventType.RETRY, reason="out of memory", model=model.alias, parallel=parallel, ctx=ctx)
-            continue
-        raise BackendsFailed(f"llama-server failed to start with {name} (lower --ctx or --parallel?)", tail)
-    FITTED[name] = parallel
-    RUNTIME.preset, RUNTIME.model, RUNTIME.topology = name, model.alias, topology
-    RUNTIME.slots, RUNTIME.parallel, RUNTIME.ctx = parallel * len(groups), parallel, ctx
-    notify(EventType.BACKENDS_READY, model_gb=round(size_gb, 2), **dump(RUNTIME), gpus=dump(gpu_stats()))
-    return backends
-
-
-def start_resident(name: str, port: int) -> subprocess.Popen[bytes]:
-    """One llama-server on GPU 0 for resident preset `name`, kept for the whole session."""
-    model = PRESETS[name]
-    proc = launch(server_binary(), model, model_files(model), port, ["0"], model.parallel, model.ctx or SETTINGS.ctx)
-    if not wait_healthy(port, proc):
-        proc.terminate()
-        proc.wait()
-        tail = (WORK / f"llama-{port}.log").read_text()[-3000:]
-        raise BackendsFailed(f"llama-server failed to start with resident {name}", tail)
-    log.info("resident %s ready on :%d", name, port)
-    return proc
+# --------------------------------------------------------------------------- balancer
 
 
 class BackendSet(Protocol):
@@ -336,61 +183,6 @@ class BackendSet(Protocol):
     def downloaded(self, name: str) -> bool: ...
     def load(self, name: str) -> list[int]: ...
 
-
-class Backends:
-    """The llama-server instances of the loaded preset and of the resident presets.
-    Blocking: the balancer calls fetch and load in a thread."""
-
-    def __init__(self) -> None:
-        self.procs: dict[int, subprocess.Popen[bytes]] = {}
-        self.residents: dict[str, int] = {}  # resident preset -> port
-        self.resident_procs: list[subprocess.Popen[bytes]] = []
-
-    def start_residents(self, names: list[str]) -> None:
-        """Start the resident presets; before the swapped one, so its out-of-memory retries
-        leave room for them."""
-        for port, name in enumerate(names, RESIDENT_PORT):
-            self.resident_procs.append(start_resident(name, port))
-            self.residents[name] = port
-
-    @property
-    def ports(self) -> list[int]:
-        return list(self.procs)
-
-    def fetch(self, name: str) -> None:
-        model_files(PRESETS[name])
-
-    def downloaded(self, name: str) -> bool:
-        return downloaded(PRESETS[name])
-
-    def load(self, name: str) -> list[int]:
-        """Replace the running instances with preset `name`'s; return their ports."""
-        self.stop()
-        self.procs = start_backends(name)
-        return self.ports
-
-    def stop(self) -> None:
-        for proc in self.procs.values():
-            proc.terminate()
-        for proc in self.procs.values():
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        self.procs = {}
-
-    def exited(self) -> bool:
-        return any(proc.poll() is not None for proc in [*self.procs.values(), *self.resident_procs])
-
-    def close(self) -> None:
-        self.stop()
-        for proc in self.resident_procs:
-            proc.terminate()
-            proc.wait()
-
-
-# --------------------------------------------------------------------------- balancer
 
 HOP_HEADERS = {
     "host",
@@ -949,7 +741,7 @@ async def serve(backends: Backends) -> tuple[str, Stats]:
 
     threading.Thread(target=TUNNELS[tunnel.kind], args=(tunnel, on_ready, notify), daemon=True).start()
     if SETTINGS.prefetch:
-        threading.Thread(target=prefetch, args=(SETTINGS.prefetch,), daemon=True).start()
+        threading.Thread(target=prefetch, args=(SETTINGS.prefetch, PRESETS), daemon=True).start()
 
     reason, last_stats = "shutdown requested", time.time()
     while not balancer.stop.is_set():
@@ -974,7 +766,7 @@ async def serve(backends: Backends) -> tuple[str, Stats]:
 def main() -> None:
     setup_logging()
     notify(EventType.STARTING, model=MODEL.alias, preset=START)
-    backends = Backends()
+    backends = Backends(SETTINGS, PRESETS, RUNTIME, notify)
     backends.fetch(START)
     notify(EventType.DOWNLOADED)
     try:

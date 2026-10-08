@@ -11,8 +11,11 @@ arguments.
 """
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
+
+from kis.schema import Topology  # inlined by `kis`
 
 WORK = Path("/kaggle/working")
 PORT = 8080  # balancer; the only port the tunnel exposes
@@ -22,3 +25,15 @@ log = logging.getLogger("kis")
 def log_file(name: str) -> IO[str]:
     """Log file for a child process; it stays open for the process lifetime."""
     return open(WORK / name, "w")
+
+
+@dataclass
+class Runtime:
+    """The loaded preset and the layout of its backends."""
+
+    preset: str = ""
+    model: str = ""  # its alias
+    topology: Topology = Topology.REPLICAS
+    slots: int = 0  # parallel x instances
+    parallel: int = 0  # slots per instance
+    ctx: int = 0  # tokens per slot

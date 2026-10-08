@@ -40,6 +40,7 @@ class KernelState(enum.StrEnum):
 INLINED = {
     "common": ROOT / "kaggle" / "common.py",
     "kis.schema": ROOT / "kis" / "schema.py",
+    "backends": ROOT / "kaggle" / "backends.py",
     "state": ROOT / "kaggle" / "state.py",
     "tunnels": ROOT / "kaggle" / "tunnels.py",
 }
