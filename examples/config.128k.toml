@@ -78,6 +78,10 @@ args = [
   # server after 25-50 min of load. Measured with 32 slots on gemma-4-e4b: 3072 held 22 GiB
   # for 68 min, 4096 reached 28.6 GiB after 71 min. Each GiB here costs about 2 GiB of RAM.
   "--cache-ram", "3072",
+  # Context checkpoints per slot (llama.cpp default 32), also kept in host RAM: 8 cut each server's
+  # memory by about 2 GiB (9.8 to 7.0) with the same cache hit rate and speed. Both options are
+  # also the kis default; an embedding model gets --cache-ram 0 unless its args say otherwise.
+  "--ctx-checkpoints", "8",
   "--metrics",
 ]
 

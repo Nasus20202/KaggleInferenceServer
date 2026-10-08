@@ -179,6 +179,8 @@ The Kaggle kernel publishes there and `kis` reads from there, so the server must
 
 `cpu` is the container's CPU use since the previous reading (every 20 s), as a share of all its cores, and each llama-server's as a share of one core. `ram` is the host memory of the Kaggle container, without the page cache: `processes` has each llama-server's anonymous memory (by port, in MiB), where its prompt cache lives, not the memory-mapped model. The server samples it every 20 s.
 
+Kaggle gives the container about 30 GiB of RAM, and each llama-server keeps its prompt cache and its context checkpoints there. llama.cpp's defaults (8192 MiB of cache and 32 checkpoints per slot) let two replicas fill it, and the kernel then kills a server. So `kis` adds `--cache-ram 3072` and `--ctx-checkpoints 8` to every llama-server unless your `args` (or the preset's) set them, and `--cache-ram 0` to an embedding model (`--embeddings`), which has no prefix to cache. With 32 slots of gemma-4-e4b this held 21 GiB for 66 minutes with the same cache hit rate. If you raise them, watch the `RAM:` line of `kis status`.
+
 In `usage`:
 - **Tokens:** `tokens_in` counts every prompt token, and `tokens_cached` the ones served from llama.cpp's prompt cache; `cache_rate` = cached / in.
 - **Speeds:** `prefill_tps` and `decode_tps` are per-request speeds, weighted by time.

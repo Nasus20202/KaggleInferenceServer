@@ -238,6 +238,35 @@ def cpu_stats(pids: dict[int, int]) -> CpuStats | None:
     return CPU.read(pids)
 
 
+# Host RAM limits for llama-server, when neither the config's args nor the preset's set them.
+# Kaggle has ~30 GiB of RAM for the whole container. llama.cpp's defaults (a prompt cache of
+# 8192 MiB and 32 context checkpoints per slot) let two replicas fill it: the kernel killed a
+# server after 23-49 min of load. Measured with 32 slots on gemma-4-e4b: these limits held 21 GiB
+# for 66 min with the same cache hit rate (0.83) and speed.
+DEFAULT_CACHE_RAM_MIB = 3072
+DEFAULT_CTX_CHECKPOINTS = 8
+CACHE_RAM_OPTIONS = ("--cache-ram", "-cram")
+CTX_CHECKPOINT_OPTIONS = ("--ctx-checkpoints", "--swa-checkpoints", "-ctxcp")
+EMBEDDING_OPTIONS = ("--embeddings", "--embedding")
+
+
+def has_option(args: list[str], names: tuple[str, ...]) -> bool:
+    """True if `args` sets any of the llama-server options `names` (as `--name value` or `--name=value`)."""
+    return any(a in names or a.split("=", 1)[0] in names for a in args)
+
+
+def memory_options(args: list[str]) -> list[str]:
+    """The host RAM limits `args` leave out. An embedding model gets no prompt cache: its inputs
+    share no prefix, so a cache would only hold RAM, and it has no use for checkpoints."""
+    embedding = has_option(args, EMBEDDING_OPTIONS)
+    out: list[str] = []
+    if not has_option(args, CACHE_RAM_OPTIONS):
+        out += ["--cache-ram", "0" if embedding else str(DEFAULT_CACHE_RAM_MIB)]
+    if not embedding and not has_option(args, CTX_CHECKPOINT_OPTIONS):
+        out += ["--ctx-checkpoints", str(DEFAULT_CTX_CHECKPOINTS)]
+    return out
+
+
 def llama_command(
     binary: str,
     model: Model,
@@ -249,7 +278,8 @@ def llama_command(
     args: list[str],
 ) -> tuple[list[str], dict[str, str]]:
     """Command and environment of one llama-server instance on `gpus` with `parallel` slots
-    of `ctx` tokens each (KV pool = parallel x ctx): `args` for every model, then the preset's.
+    of `ctx` tokens each (KV pool = parallel x ctx): `args` for every model, then the preset's, then
+    the RAM limits they leave out (see memory_options).
     No web UI: the balancer requires an API key on every route, which a browser doesn't send."""
     model_path, draft_path = paths
     cmd = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port), "--alias", model.alias, "--no-webui"]
@@ -259,4 +289,5 @@ def llama_command(
     if len(gpus) > 1:
         cmd += ["--split-mode", "layer", "--tensor-split", model.tensor_split or ",".join("1" * len(gpus))]
     cmd += args + model.args
+    cmd += memory_options(args + model.args)
     return cmd, {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(gpus)}

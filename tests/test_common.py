@@ -14,6 +14,7 @@ def test_replica_command():
     assert cmd == [
         "llama-server", "-m", "m.gguf", "--host", "127.0.0.1", "--port", "8090", "--alias", "m",
         "--no-webui", "--parallel", "4", "--kv-unified-per-slot", "65536", "--metrics", "--temp", "1.0",
+        "--cache-ram", "3072", "--ctx-checkpoints", "8",
     ]  # fmt: skip
     assert env["CUDA_VISIBLE_DEVICES"] == "1"
 
@@ -154,3 +155,28 @@ def test_cpu_meter_reports_use_between_two_readings(tmp_path, monkeypatch):
     clock["t"] += 1
     set_cpu(31.0, 4100)
     assert meter.read({8090: 42}) == CpuStats(cores=2.0, used_pct=50, processes={"8090": 150})  # too soon: repeated
+
+
+def command(*args: str, model_args: tuple[str, ...] = ()) -> list[str]:
+    model = dataclasses.replace(MODEL, args=list(model_args))
+    return common.llama_command("llama-server", model, ("m.gguf", None), 8090, ["0"], 1, 32768, list(args))[0]
+
+
+def test_ram_limits_default_to_what_kaggle_can_hold():
+    cmd = command("--metrics")
+    assert cmd[cmd.index("--cache-ram") + 1] == "3072" and cmd[cmd.index("--ctx-checkpoints") + 1] == "8"
+
+
+def test_ram_limits_set_by_the_config_or_the_preset_are_kept():
+    cmd = command("--cache-ram", "2048", model_args=("--ctx-checkpoints", "16"))
+    assert cmd.count("--cache-ram") == 1 and cmd[cmd.index("--cache-ram") + 1] == "2048"
+    assert cmd.count("--ctx-checkpoints") == 1 and cmd[cmd.index("--ctx-checkpoints") + 1] == "16"
+    short = command("-cram", "1024", "--swa-checkpoints=4")
+    assert "--cache-ram" not in short and "--ctx-checkpoints" not in short
+
+
+def test_an_embedding_model_gets_no_prompt_cache_and_no_checkpoints():
+    cmd = command(model_args=("--embeddings",))
+    assert cmd[cmd.index("--cache-ram") + 1] == "0" and "--ctx-checkpoints" not in cmd
+    kept = command("--embeddings", "--cache-ram", "512")
+    assert kept[kept.index("--cache-ram") + 1] == "512"
