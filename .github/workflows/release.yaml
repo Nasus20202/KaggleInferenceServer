@@ -1,0 +1,85 @@
+name: Release
+
+# Sets the version in pyproject.toml and uv.lock, commits it to main, tags it and
+# creates a GitHub release. CI then builds and publishes the image for the tag.
+# A tag pushed with GITHUB_TOKEN does not start workflows, so the last step starts
+# ci.yaml on the tag itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v (for example 1.2.0)
+        required: true
+        type: string
+      dry_run:
+        description: Prepare the release commit and notes, but push and create nothing
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the version commit and the tag, create the release
+  actions: write # start ci.yaml on the tag
+
+env:
+  VERSION: ${{ inputs.version }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the version
+        run: |
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::'$VERSION' is not a plain MAJOR.MINOR.PATCH version"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check the tag is free and CI passed on main
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION already exists"
+            exit 1
+          fi
+          sha=$(git rev-parse HEAD)
+          ok=$(gh run list --workflow ci.yaml --commit "$sha" --json conclusion,event \
+            --jq '[.[] | select(.event == "push" and .conclusion == "success")] | length')
+          if [ "$ok" -lt 1 ]; then
+            echo "::error::CI has not passed on $sha (main); wait for it or fix it first"
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Set the version
+        run: uv version "$VERSION"
+
+      - name: Commit and tag
+        run: |
+          git config user.name "Krzysztof Nasuta"
+          git config user.email "krzysztof@nasuta.dev"
+          git commit -am "chore(release): v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git show --stat HEAD
+
+      - name: Push
+        if: ${{ !inputs.dry_run }}
+        run: git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"
+
+      - name: Create the release
+        if: ${{ !inputs.dry_run }}
+        run: gh release create "v$VERSION" --verify-tag --title "v$VERSION" --generate-notes
+
+      - name: Build and publish the image
+        if: ${{ !inputs.dry_run }}
+        run: gh workflow run ci.yaml --ref "v$VERSION"
