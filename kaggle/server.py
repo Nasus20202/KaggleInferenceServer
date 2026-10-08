@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 from backends import Backends, BackendsFailed, prefetch  # inlined by `kis`
 from balancer import Balancer  # inlined by `kis`
-from common import fit_message, publish, ram_stats  # inlined by `kis`
+from common import cpu_stats, fit_message, publish, ram_stats  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     Event,
@@ -193,6 +193,7 @@ async def serve(backends: Backends) -> tuple[str, Stats, dict[str, object]]:
             extra = {**crash, "ram_before": dump(ram), "ram_peak_mib": ram_peak_mib}
         else:
             ram = await asyncio.to_thread(ram_stats, backends.pids)
+            await asyncio.to_thread(cpu_stats, backends.pids)  # keeps the CPU window short
             ram_peak_mib = max(ram_peak_mib, ram.used_mib if ram else 0)
             continue
         break
@@ -218,7 +219,8 @@ def main() -> None:
         reason, stats, extra = asyncio.run(serve(backends))
     finally:
         backends.close()
-    notify(EventType.STOPPED, reason=reason, **extra, **dump(stats))
+    log = extra.pop("log", None)  # last: the longest field
+    notify(EventType.STOPPED, reason=reason, **extra, **dump(stats), **({"log": log} if log else {}))
 
 
 if __name__ == "__main__":

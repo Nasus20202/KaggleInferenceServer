@@ -89,6 +89,9 @@ def format_stats(s: Stats) -> str:
     for g in s.gpus:
         vram = f"{g.used_mib / 1024:.1f} / {g.total_mib / 1024:.1f} GiB VRAM"
         lines.append(f"GPU{g.gpu}: {vram}, {g.util_pct}% busy")
+    if s.cpu:
+        procs = ", ".join(f"llama-server :{port} {pct}%" for port, pct in s.cpu.processes.items())
+        lines.append(f"CPU: {s.cpu.used_pct}% of {s.cpu.cores:g} cores" + (f" ({procs})" if procs else ""))
     if s.ram:
         procs = ", ".join(f"llama-server :{port} {mib / 1024:.1f} GiB" for port, mib in s.ram.processes.items())
         lines.append(

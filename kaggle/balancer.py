@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import web
 
 from backends import FITTED, BackendsFailed  # inlined by `kis`
-from common import gpu_stats, ram_stats  # inlined by `kis`
+from common import cpu_stats, gpu_stats, ram_stats  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     EventType,
@@ -517,21 +517,22 @@ class Balancer:
     async def stats(self) -> Stats:
         return Stats(
             session=self.settings.session,
-            model=self.presets[self.loaded].alias,
             preset=self.loaded,
+            model=self.presets[self.loaded].alias,
             topology=self.runtime.topology,
             slots=self.runtime.slots,
             parallel=self.runtime.parallel,
             ctx=self.runtime.ctx,
+            resident=[self.presets[name].alias for name in self.residents],
             uptime_s=round(time.time() - STARTED),
             idle_s=round(self.idle_seconds),
-            inflight=sum(self.inflight.values()),
             requests=self.requests,
+            inflight=sum(self.inflight.values()),
             errors=self.errors,
             usage={model: u.summary() for model, u in self.usage.items()},
             gpus=await asyncio.to_thread(gpu_stats),
+            cpu=await asyncio.to_thread(cpu_stats, self.backends.pids),
             ram=await asyncio.to_thread(ram_stats, self.backends.pids),
-            resident=[self.presets[name].alias for name in self.residents],
         )
 
     def logs(self, req: web.Request) -> web.Response:

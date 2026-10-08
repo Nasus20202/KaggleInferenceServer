@@ -13,10 +13,12 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
-from kis.schema import Event, GpuStats, Model, Ntfy, RamStats
+from kis.schema import CpuStats, Event, GpuStats, Model, Ntfy, RamStats
 
 CGROUP, PROC = Path("/sys/fs/cgroup"), Path("/proc")  # the container's memory accounting, and the processes
 MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
@@ -161,6 +163,79 @@ def ram_stats(pids: dict[int, int]) -> RamStats | None:
         return None
     sizes = {str(port): process_memory(pid) for port, pid in pids.items()}
     return RamStats(memory[0], memory[1], {port: mib for port, mib in sizes.items() if mib is not None})
+
+
+def cpu_seconds() -> float | None:
+    """CPU time used by the whole container so far: its cgroup (v2, then v1), else the machine's."""
+    usec = _field(_read(CGROUP / "cpu.stat"), "usage_usec")
+    if usec is not None:
+        return usec / 1e6
+    nsec = (_read(CGROUP / "cpuacct/cpuacct.usage") or _read(CGROUP / "cpu/cpuacct.usage") or "").strip()
+    if nsec.isdigit():
+        return int(nsec) / 1e9
+    parts = ((_read(PROC / "stat") or "").splitlines() or [""])[0].split()[1:]  # "cpu user nice system idle ..."
+    busy = [int(p) for p in parts[:3] + parts[5:8] if p.isdigit()]  # not idle, iowait or guest
+    return sum(busy) / os.sysconf("SC_CLK_TCK") if busy else None
+
+
+def cpu_cores() -> float:
+    """CPUs the container may use: its cgroup quota if it has one, else the machine's."""
+    quota = (_read(CGROUP / "cpu.max") or "").split()  # "max 100000" or "400000 100000"
+    if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
+        return min(int(quota[0]) / int(quota[1]), float(os.cpu_count() or 1))
+    return float(os.cpu_count() or 1)
+
+
+def process_cpu_seconds(pid: int) -> float | None:
+    """User + system CPU time of a process; None if it is gone."""
+    stat = _read(PROC / str(pid) / "stat")
+    if stat is None:
+        return None
+    fields = stat.rpartition(")")[2].split()  # after the command name, which may hold spaces
+    if len(fields) < 13 or not (fields[11].isdigit() and fields[12].isdigit()):
+        return None
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+class CpuMeter:
+    """CPU use between one reading and the next. Readings less than MIN_WINDOW_S apart (the
+    stats heartbeat right after the sampler) repeat the last result instead of a noisy one."""
+
+    MIN_WINDOW_S = 5.0
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last: tuple[float, float, dict[int, float]] | None = None  # time, container cpu s, per pid
+        self.result: CpuStats | None = None
+
+    def read(self, pids: dict[int, int]) -> CpuStats | None:
+        now, total = time.monotonic(), cpu_seconds()
+        if total is None:
+            return None
+        procs = {pid: s for pid in pids.values() if (s := process_cpu_seconds(pid)) is not None}
+        with self.lock:
+            if self.last is None or now - self.last[0] >= self.MIN_WINDOW_S:
+                if self.last is not None:
+                    before, total_before, procs_before = self.last
+                    window, cores = now - before, cpu_cores()
+                    used = (total - total_before) / window / cores * 100
+                    by_port = {
+                        str(port): round((procs[pid] - procs_before[pid]) / window * 100)
+                        for port, pid in pids.items()
+                        if pid in procs and pid in procs_before
+                    }
+                    self.result = CpuStats(cores, min(100, max(0, round(used))), by_port)
+                self.last = (now, total, procs)
+            return self.result
+
+
+CPU = CpuMeter()
+
+
+def cpu_stats(pids: dict[int, int]) -> CpuStats | None:
+    """CPU use of the container and of the llama-servers `pids` (port -> pid) since the last call;
+    None until there are two readings."""
+    return CPU.read(pids)
 
 
 def llama_command(
