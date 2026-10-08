@@ -188,6 +188,7 @@ class ServerConfig:
     replica_max_gb: float = 11.0
     ctx: int = 32768
     max_queue: int | None = None  # requests waiting beyond the slots before 429; None = no limit
+    sticky_slack: int = 4  # see `pick` in kaggle/balancer.py; -1 = always the least busy instance
     args: list[str] = field(default_factory=list)
 
 

@@ -94,6 +94,7 @@ def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) ->
         replica_max_gb=server.replica_max_gb,
         ctx=server.ctx,
         max_queue=server.max_queue,
+        sticky_slack=server.sticky_slack,
         args=server.args,
     )
 

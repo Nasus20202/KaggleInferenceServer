@@ -8,6 +8,7 @@ runtime layout and `notify` come from server.py as arguments.
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
 import re
 import time
@@ -48,6 +49,49 @@ class BackendSet(Protocol):
     def fetch(self, name: str) -> None: ...
     def downloaded(self, name: str) -> bool: ...
     def load(self, name: str) -> list[int]: ...
+
+
+def affinity_key(body: bytes) -> str | None:
+    """Identifies the conversation of a chat or completion request, so its turns can go to the
+    instance that already holds its prompt cache. Only what stays the same from turn to turn
+    counts: the tools, the system messages and the first user message (a hash of the whole
+    history would change every turn). None for anything else."""
+    if b'"messages"' not in body and b'"prompt"' not in body:
+        return None
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    parts: list[Any] = [doc.get("tools")]
+    messages = doc.get("messages")
+    if isinstance(messages, list):
+        first_user = False
+        for m in messages:
+            role = m.get("role") if isinstance(m, dict) else None
+            if role in ("system", "developer"):
+                parts.append(m)
+            elif role == "user" and not first_user:
+                parts.append(m)
+                first_user = True
+    elif isinstance(doc.get("prompt"), str):
+        parts.append(doc["prompt"][:4096])
+    else:
+        return None
+    return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def pick(inflight: dict[int, int], key: str | None, slack: int) -> int:
+    """The port for a request: the instance `key` hashes to, unless it has more than `slack`
+    requests in flight beyond the least busy one (then the load wins over the cache);
+    without a key, or with a negative slack, the least busy."""
+    least = min(inflight, key=lambda p: inflight[p])
+    if key is None or slack < 0 or len(inflight) < 2:
+        return least
+    ports = sorted(inflight)
+    preferred = ports[int(key, 16) % len(ports)]
+    return preferred if inflight[preferred] - inflight[least] <= slack else least
 
 
 HOP_HEADERS = {
@@ -186,8 +230,9 @@ class Swap:
 
 class Balancer:
     """Checks the API key, swaps to the preset a request names (autoload) and sends each
-    request to the instance of the loaded preset with the fewest in flight. Requests for
-    a resident preset go to its instance."""
+    request to an instance of the loaded preset: the one that already holds its conversation's
+    prompt cache, or the one with the fewest in flight. Requests for a resident preset go to
+    its instance."""
 
     def __init__(
         self,
@@ -282,6 +327,7 @@ class Balancer:
         self.last_activity = start = time.time()
         port, status, detail = 0, 0, ""
         name: str | None = None
+        key: str | None = None  # the conversation, for sticky routing
 
         async def connect() -> aiohttp.ClientResponse:
             nonlocal port, admitted
@@ -289,7 +335,7 @@ class Balancer:
                 port = self.residents[name]
                 self.resident_inflight += 1
             else:
-                port = await self.admit(name)
+                port = await self.admit(name, key)
             self.waiting -= 1  # now in flight
             admitted = True
             headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
@@ -300,6 +346,8 @@ class Balancer:
 
         try:
             body = await req.read()
+            if req.method == "POST" and self.settings.sticky_slack >= 0:
+                key = affinity_key(body)
             try:
                 name = self.requested(req, body)
             except SwapFailed as e:
@@ -366,13 +414,13 @@ class Balancer:
             raise SwapFailed(f"model {name} is not loaded ({loaded} is) and autoload is off: `kis use {preset}`")
         return preset
 
-    async def admit(self, name: str | None) -> int:
+    async def admit(self, name: str | None, key: str | None = None) -> int:
         """Wait until preset `name` (None: whichever is loaded) serves, then count the request
-        in flight on its least busy instance; return that instance's port."""
+        in flight on one of its instances (see `pick`); return that instance's port."""
         await self.ensure(name)
         if not self.inflight:
             raise SwapFailed(self.failure or "no model loaded")
-        port = min(self.inflight, key=lambda p: self.inflight[p])
+        port = pick(self.inflight, key, self.settings.sticky_slack)
         self.inflight[port] += 1
         return port
 

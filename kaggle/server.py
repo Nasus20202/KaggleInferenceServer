@@ -73,6 +73,7 @@ CONFIG = {
     "replica_max_gb": 11.0,
     "ctx": 32768,
     "max_queue": None,
+    "sticky_slack": 4,
     "args": ["--n-gpu-layers", "999", "--flash-attn", "auto", "--metrics"],
 }
 # </params>

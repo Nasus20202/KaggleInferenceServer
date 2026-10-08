@@ -205,6 +205,8 @@ Clients see no errors, but the new session starts with an empty prompt cache. Fo
 
 Sessions also stop 2 minutes before the weekly GPU quota runs out, with a clean `stopped` event. A rollover isn't started with less than 15 minutes of quota left.
 
+`sticky_slack` (4 by default) keeps the turns of one conversation on the same replica, so its prompt cache is reused: requests are matched by their tools, system messages and first user message. If that replica has more than `sticky_slack` requests in flight beyond the other one, the request goes to the less busy one instead; -1 turns this off.
+
 `max_queue` (unset by default) caps the requests waiting beyond the slots. When the cap is reached, the server answers 429 with `Retry-After: 5`, and `kis proxy` retries with backoff.
 
 ## Models

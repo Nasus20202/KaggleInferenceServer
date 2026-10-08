@@ -46,6 +46,10 @@ rollover_hours = 11.0
 # Requests that may wait beyond the slots before the server answers 429 (Retry-After: 5).
 # Unset = no limit (llama-server queues them).
 # max_queue = 8
+# The turns of one conversation go to the same replica, which holds its prompt cache, unless that
+# replica has more than this many requests in flight beyond the other one: then the load wins.
+# -1 = always the least busy replica. Models on both GPUs (split) have one instance: no effect.
+sticky_slack = 4
 # Replicate the model on each GPU when its files are at most this size; otherwise
 # split one instance across both GPUs. Per-model `topology` overrides it.
 replica_max_gb = 11.0
