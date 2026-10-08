@@ -1,9 +1,7 @@
 name: Release
 
-# Sets the version in pyproject.toml and uv.lock, commits it to main, tags it and
-# creates a GitHub release. CI then builds and publishes the image for the tag.
-# A tag pushed with GITHUB_TOKEN does not start workflows, so the last step starts
-# ci.yaml on the tag itself.
+# Sets the version, commits it to main, tags it and creates a release; the tag push starts CI.
+# Pushes use the deploy key RELEASE_DEPLOY_KEY, which bypasses the ruleset on main.
 
 on:
   workflow_dispatch:
@@ -22,8 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # push the version commit and the tag, create the release
-  actions: write # start ci.yaml on the tag
+  contents: write
 
 env:
   VERSION: ${{ inputs.version }}
@@ -44,6 +41,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
       - name: Check the tag is free and CI passed on main
         run: |
@@ -79,7 +77,3 @@ jobs:
       - name: Create the release
         if: ${{ !inputs.dry_run }}
         run: gh release create "v$VERSION" --verify-tag --title "v$VERSION" --generate-notes
-
-      - name: Build and publish the image
-        if: ${{ !inputs.dry_run }}
-        run: gh workflow run ci.yaml --ref "v$VERSION"
