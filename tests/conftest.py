@@ -12,7 +12,7 @@ from aiohttp import web
 from kis.settings import Config, Secrets, parse_config
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "kaggle"))  # the Kaggle scripts import kaggle/common.py (inlined when pushed)
+sys.path.insert(0, str(ROOT / "kaggle"))  # the Kaggle scripts import their modules from kaggle/ (inlined when pushed)
 
 
 @pytest.fixture(scope="session")
@@ -109,9 +109,26 @@ async def llama_servers(aiohttp_server):
     return [await aiohttp_server(fake_llama_server(f"gpu{i}", delay=0.2)) for i in range(2)]
 
 
+def make_balancer(server, backends, presets=None, loaded=None, residents=None):
+    """A Balancer wired to the settings, runtime and notify of `server` (read when called, so
+    tests can patch them first), with the api key "secret"."""
+    from balancer import Balancer  # on sys.path since the line above
+
+    return Balancer(
+        backends,
+        "secret",
+        server.SETTINGS,
+        server.RUNTIME,
+        server.notify,
+        presets or server.PRESETS,
+        loaded or server.START,
+        residents,
+    )
+
+
 @pytest.fixture
 async def balancer(server, llama_servers):
-    return server.Balancer(FakeBackends({server.START: [s.port for s in llama_servers]}, server.START), "secret")
+    return make_balancer(server, FakeBackends({server.START: [s.port for s in llama_servers]}, server.START))
 
 
 @pytest.fixture(autouse=True)

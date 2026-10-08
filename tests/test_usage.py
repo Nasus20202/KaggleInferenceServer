@@ -1,10 +1,11 @@
-"""Token and speed stats parsed from llama-server responses (kaggle/server.py)."""
+"""Token and speed stats parsed from llama-server responses (kaggle/balancer.py)."""
 
 import json
 
 from aiohttp import web
-from conftest import FakeBackends
+from conftest import FakeBackends, make_balancer
 
+from balancer import Usage, parse_usage
 from kis.schema import EventType, Model, Notify, Ntfy
 
 AUTH = {"Authorization": "Bearer secret"}
@@ -20,29 +21,32 @@ TIMINGS = {
 }
 
 
-def test_parse_json_body(server):
+def test_parse_json_body():
     body = b"   " + json.dumps({"model": "m", "usage": USAGE, "timings": TIMINGS}).encode()  # keepalive spaces
-    u = server.parse_usage(body, sse=False)
+    u = parse_usage(body, sse=False)
+    assert u
     assert (u.model, u.tokens_in, u.tokens_out, u.cached) == ("m", 100, 50, 80)
     assert u.describe() == "in=100 cached=80 out=50 prefill=200tok/s decode=50.0tok/s draft=75%"
 
 
-def test_parse_sse_stream_with_timings_only(server):
+def test_parse_sse_stream_with_timings_only():
     events = [{"choices": [{"delta": {"content": "hi"}}]}, {"choices": [], "timings": TIMINGS}]
     body = b": keepalive\n\n" + b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events)
     body += b"data: [DONE]\n\n"
-    u = server.parse_usage(body, sse=True)
+    u = parse_usage(body, sse=True)
+    assert u
     assert (u.tokens_in, u.tokens_out, u.cached) == (100, 50, 80)
 
 
-def test_no_usage(server):
-    assert server.parse_usage(b'{"data": []}', sse=False) is None
-    assert server.parse_usage(b"not json", sse=False) is None
+def test_no_usage():
+    assert parse_usage(b'{"data": []}', sse=False) is None
+    assert parse_usage(b"not json", sse=False) is None
 
 
-def test_totals_per_model(server):
-    usage = server.Usage()
-    u = server.parse_usage(json.dumps({"usage": USAGE, "timings": TIMINGS}).encode(), sse=False)
+def test_totals_per_model():
+    usage = Usage()
+    u = parse_usage(json.dumps({"usage": USAGE, "timings": TIMINGS}).encode(), sse=False)
+    assert u
     usage.add(u)
     usage.add(u)
     s = usage.summary()
@@ -95,7 +99,7 @@ async def test_usage_of_responses_too_large_to_keep_whole(server, aiohttp_server
         "e": Model(repo="r", file="e.gguf", alias="E", parallel=1),
     }
     backends = FakeBackends({"a": []}, "a")
-    balancer = server.Balancer(backends, "secret", presets=presets, loaded="a", residents={"e": embedder.port})
+    balancer = make_balancer(server, backends, presets, "a", {"e": embedder.port})
     client = await aiohttp_client(balancer.app())
     for order in orders:
         resp = await client.post("/v1/embeddings", json={"model": "e", "input": order}, headers=AUTH)

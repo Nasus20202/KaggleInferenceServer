@@ -1,10 +1,11 @@
-"""Model hotswap in the Kaggle-side balancer (kaggle/server.py): autoload, /admin/load, /v1/models."""
+"""Model hotswap in the Kaggle-side balancer (kaggle/balancer.py): autoload, /admin/load, /v1/models."""
 
 import asyncio
 
 import pytest
-from conftest import FakeBackends, fake_llama_server
+from conftest import FakeBackends, fake_llama_server, make_balancer
 
+import balancer as balancer_mod
 from kis.schema import EventType, Model
 
 AUTH = {"Authorization": "Bearer secret"}
@@ -30,7 +31,7 @@ async def swapper(server, aiohttp_server, aiohttp_client, events):
         return (await aiohttp_server(fake_llama_server(name, delay=0.2))).port
 
     backends = FakeBackends({"a": [await backend("a0"), await backend("a1")], "b": [await backend("b0")]}, "a")
-    balancer = server.Balancer(backends, "secret", presets=PRESETS, loaded="a")
+    balancer = make_balancer(server, backends, PRESETS, "a")
     return balancer, backends, await aiohttp_client(balancer.app())
 
 
@@ -163,7 +164,7 @@ async def test_without_autoload_only_admin_load_swaps(swapper, server, monkeypat
 
 async def test_keepalive_while_waiting_for_a_swap(swapper, server, monkeypatch):
     """A swap can take minutes: bytes flow before Cloudflare's 100 s limit, then the answer."""
-    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr(balancer_mod, "KEEPALIVE_SECONDS", 0.05)
     _, backends, client = swapper
     backends.fetch_s = 0.3
     resp = await client.post("/v1/chat/completions", json={"model": "b", "stream": True}, headers=AUTH)
@@ -172,7 +173,7 @@ async def test_keepalive_while_waiting_for_a_swap(swapper, server, monkeypatch):
 
 
 async def test_a_failed_swap_after_keepalive_sends_the_error_in_the_body(swapper, server, monkeypatch):
-    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr(balancer_mod, "KEEPALIVE_SECONDS", 0.05)
     _, backends, client = swapper
     backends.fetch_s, backends.fail = 0.3, ("b",)
     resp = await client.post("/v1/chat/completions", json={"model": "b"}, headers=AUTH)
@@ -181,8 +182,8 @@ async def test_a_failed_swap_after_keepalive_sends_the_error_in_the_body(swapper
 
 
 async def test_models_report_context_and_slots(swapper, server, monkeypatch):
-    _, _, client = swapper
-    monkeypatch.setattr(server, "RUNTIME", server.Runtime("a", "A-Q4", "replicas", slots=8, parallel=4, ctx=65536))
+    balancer, _, client = swapper
+    monkeypatch.setattr(balancer, "runtime", server.Runtime("a", "A-Q4", "replicas", slots=8, parallel=4, ctx=65536))
     monkeypatch.setattr(server.SETTINGS, "ctx", 32768)
     models = (await (await client.get("/v1/models", headers=AUTH)).json())["data"]
     layout = [(m["context_length"], m["parallel"], m["slots"], m["topology"]) for m in models]
@@ -195,7 +196,7 @@ async def with_resident(server, aiohttp_server, aiohttp_client):
     embedder = await aiohttp_server(fake_llama_server("e0"))
     presets = {**PRESETS, "e": Model(repo="r", file="e.gguf", alias="E-Q8", parallel=4, ctx=2048)}
     backends = FakeBackends({"a": [(await aiohttp_server(fake_llama_server("a0"))).port], "b": []}, "a")
-    balancer = server.Balancer(backends, "secret", presets=presets, loaded="a", residents={"e": embedder.port})
+    balancer = make_balancer(server, backends, presets, "a", {"e": embedder.port})
     return balancer, backends, await aiohttp_client(balancer.app()), embedder
 
 

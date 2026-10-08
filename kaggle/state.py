@@ -11,6 +11,7 @@ arguments.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -20,6 +21,7 @@ from kis.schema import Topology  # inlined by `kis`
 WORK = Path("/kaggle/working")
 PORT = 8080  # balancer; the only port the tunnel exposes
 log = logging.getLogger("kis")
+STARTED = time.time()
 
 
 def log_file(name: str) -> IO[str]:

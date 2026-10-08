@@ -41,6 +41,7 @@ INLINED = {
     "common": ROOT / "kaggle" / "common.py",
     "kis.schema": ROOT / "kis" / "schema.py",
     "backends": ROOT / "kaggle" / "backends.py",
+    "balancer": ROOT / "kaggle" / "balancer.py",
     "state": ROOT / "kaggle" / "state.py",
     "tunnels": ROOT / "kaggle" / "tunnels.py",
 }

@@ -5,7 +5,7 @@ import dataclasses
 from http import HTTPStatus
 
 import pytest
-from conftest import SECRETS, FakeBackends, fake_llama_server
+from conftest import SECRETS, FakeBackends, fake_llama_server, make_balancer
 
 from kis import events, proxy, rollover, settings
 from kis.client import AdminClient
@@ -93,7 +93,7 @@ def test_rollover_needs_the_settings_of_kis_up(monkeypatch, config):
 
 async def balancer_server(server, aiohttp_server, name: str, delay: float):
     backend = await aiohttp_server(fake_llama_server(name, delay=delay))
-    balancer = server.Balancer(FakeBackends({server.START: [backend.port]}, server.START), "secret")
+    balancer = make_balancer(server, FakeBackends({server.START: [backend.port]}, server.START))
     site = await aiohttp_server(balancer.app())
     return balancer, str(site.make_url("")).rstrip("/")
 
