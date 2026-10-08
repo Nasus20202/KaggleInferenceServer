@@ -8,6 +8,7 @@ runtime layout and `notify` come from server.py as arguments.
 import functools
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -98,6 +99,18 @@ def plan(
 
 OOM = re.compile(r"out of memory|failed to allocate", re.IGNORECASE)
 FITTED: dict[str, int] = {}  # preset -> slots per instance that fit, so loading it again skips the retries
+
+
+CRASH_LOG_CHARS = 3000  # of a crashed llama-server's log; notify() cuts it further to fit a ntfy message
+
+
+def describe_exit(code: int) -> str:
+    """How a process ended, from its return code (negative: the signal that killed it)."""
+    if code >= 0:
+        return f"exited with code {code}"
+    name = signal.Signals(-code).name if -code in signal.valid_signals() else f"signal {-code}"
+    hint = " (the kernel's OOM killer sends it when the container is out of RAM)" if -code == signal.SIGKILL else ""
+    return f"killed by {name}{hint}"
 
 
 class BackendsFailed(RuntimeError):
@@ -218,8 +231,24 @@ class Backends:
                 proc.wait()
         self.procs = {}
 
-    def exited(self) -> bool:
-        return any(proc.poll() is not None for proc in [*self.procs.values(), *self.resident_procs])
+    @property
+    def pids(self) -> dict[int, int]:
+        """Port -> pid of every running llama-server, resident ones too."""
+        residents = zip(self.residents.values(), self.resident_procs, strict=False)
+        return {port: proc.pid for port, proc in [*self.procs.items(), *residents]}
+
+    def crash(self) -> dict[str, object] | None:
+        """Stopped-event fields for the first llama-server that has exited: how it ended and its log tail."""
+        residents = zip(self.residents.values(), self.resident_procs, strict=False)
+        for port, proc in [*self.procs.items(), *residents]:
+            code = proc.poll()
+            if code is not None:
+                try:
+                    tail = (WORK / f"llama-{port}.log").read_text(errors="replace")[-CRASH_LOG_CHARS:]
+                except OSError:
+                    tail = ""
+                return {"crashed_port": port, "exit_code": code, "exit": describe_exit(code), "log": tail}
+        return None
 
     def close(self) -> None:
         self.stop()

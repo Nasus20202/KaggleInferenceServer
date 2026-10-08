@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 from backends import Backends, BackendsFailed, prefetch  # inlined by `kis`
 from balancer import Balancer  # inlined by `kis`
-from common import publish  # inlined by `kis`
+from common import fit_message, publish, ram_stats  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     SERVER_LOG,
     Event,
@@ -118,7 +118,7 @@ class Notification:
 
 def notify(kind: EventType, **data: object) -> None:
     """Log a status event and publish it to the ntfy topic that `kis` follows."""
-    event = Event(kind, t=round(time.time() - STARTED), session=SETTINGS.session, data=data)
+    event = fit_message(Event(kind, t=round(time.time() - STARTED), session=SETTINGS.session, data=data))
     log.info("event %s", json.dumps(event.to_json()))
     try:
         publish(SETTINGS.ntfy, SETTINGS.ntfy_topic, event)
@@ -140,7 +140,9 @@ def notification(event: Event) -> Notification | None:
         message = f"{layout}, ready after {event.t} s"
         return Notification(f"{model} ready", message, tags="white_check_mark")
     if event.type == EventType.STOPPED:
-        return Notification(f"{model} stopped", f"{event.problem} after {round(event.t / 60)} min", tags="stop_sign")
+        how = event.data.get("exit")
+        problem = f"{event.problem} ({how})" if how else event.problem
+        return Notification(f"{model} stopped", f"{problem} after {round(event.t / 60)} min", tags="stop_sign")
     if event.type == EventType.ERROR:
         return Notification(f"{model} failed", event.problem[:300], Priority.HIGH, "warning")
     if event.type == EventType.RETRY:
@@ -159,8 +161,9 @@ def notification(event: Event) -> Notification | None:
 # --------------------------------------------------------------------------- main
 
 
-async def serve(backends: Backends) -> tuple[str, Stats]:
-    """Run the balancer and tunnel until shutdown; return the stop reason and the final stats."""
+async def serve(backends: Backends) -> tuple[str, Stats, dict[str, object]]:
+    """Run the balancer and tunnel until shutdown; return the stop reason, the final stats and,
+    if a llama-server died, how (its exit, its log and the memory just before)."""
     balancer = Balancer(
         backends, SETTINGS.api_key, SETTINGS, RUNTIME, notify, PRESETS, START, residents=backends.residents
     )
@@ -174,7 +177,8 @@ async def serve(backends: Backends) -> tuple[str, Stats]:
     if SETTINGS.prefetch:
         threading.Thread(target=prefetch, args=(SETTINGS.prefetch, PRESETS), daemon=True).start()
 
-    reason, last_stats = "shutdown requested", time.time()
+    reason, last_stats, extra = "shutdown requested", time.time(), {}
+    ram, ram_peak_mib = None, 0  # host memory at the last check, and its peak this session
     while not balancer.stop.is_set():
         await asyncio.sleep(20)
         if time.time() - last_stats > STATS_MINUTES * 60:
@@ -184,14 +188,17 @@ async def serve(backends: Backends) -> tuple[str, Stats]:
             reason = f"idle for {SETTINGS.idle_minutes:g} min"
         elif time.time() - STARTED > SETTINGS.max_hours * 3600:
             reason = "max_hours reached"
-        elif not balancer.loading and backends.exited():
+        elif not balancer.loading and (crash := backends.crash()):
             reason = "llama-server exited"
+            extra = {**crash, "ram_before": dump(ram), "ram_peak_mib": ram_peak_mib}
         else:
+            ram = await asyncio.to_thread(ram_stats, backends.pids)
+            ram_peak_mib = max(ram_peak_mib, ram.used_mib if ram else 0)
             continue
         break
     stats = await balancer.stats()
     await balancer.close()
-    return balancer.failure or reason, stats
+    return balancer.failure or reason, stats, extra
 
 
 def main() -> None:
@@ -208,10 +215,10 @@ def main() -> None:
         backends.close()
         sys.exit(1)
     try:
-        reason, stats = asyncio.run(serve(backends))
+        reason, stats, extra = asyncio.run(serve(backends))
     finally:
         backends.close()
-    notify(EventType.STOPPED, reason=reason, **dump(stats))
+    notify(EventType.STOPPED, reason=reason, **extra, **dump(stats))
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ def test_format_stats():
         "uptime_s": 600,
         "idle_s": 0,
         "gpus": [{"gpu": 0, "used_mib": 13907, "total_mib": 15360, "util_pct": 87}],
+        "ram": {"used_mib": 12288, "total_mib": 30720, "processes": {"8090": 3072}},
         "usage": {
             "m": {
                 "requests": 2,
@@ -42,6 +43,7 @@ def test_format_stats():
     text = status.format_stats(load(Stats, stats))
     assert "4 slots x 131072 tokens" in text
     assert "GPU0: 13.6 / 15.0 GiB VRAM, 87% busy" in text
+    assert "RAM: 12.0 / 30.0 GiB (llama-server :8090 3.0 GiB)" in text
     assert "m: 2 completions, tokens in 200 (cached 160, 80%), out 100; prefill 200.0 tok/s" in text
 
 

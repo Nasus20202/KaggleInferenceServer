@@ -304,6 +304,15 @@ class GpuStats:
 
 
 @dataclass(frozen=True)
+class RamStats:
+    """Host memory of the Kaggle container, where llama-server keeps its prompt cache."""
+
+    used_mib: int  # without the page cache, which the kernel drops under pressure
+    total_mib: int  # the container's limit, or the machine's memory if it has none
+    processes: dict[str, int] = field(default_factory=dict)  # llama-server port -> anonymous RSS (MiB)
+
+
+@dataclass(frozen=True)
 class UsageSummary:
     """Totals of the completions of one model since the session started."""
 
@@ -334,6 +343,7 @@ class Stats:
     gpus: list[GpuStats]
     preset: str = ""  # name of the loaded preset
     resident: list[str] = field(default_factory=list)  # aliases of the resident presets
+    ram: RamStats | None = None
 
 
 # --------------------------------------------------------------------------- calibration
