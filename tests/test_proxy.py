@@ -1,7 +1,11 @@
 """Local proxy (kis/proxy.py) chained to the Kaggle-side balancer and fake llama-servers."""
 
+import asyncio
+import contextlib
 import dataclasses
+import json
 
+import aiohttp
 import pytest
 from conftest import SECRETS
 
@@ -108,3 +112,66 @@ async def test_optional_local_api_key(aiohttp_client, monkeypatch, config, balan
     assert (await client.get("/v1/models", headers={"Authorization": "Bearer nope"})).status == 401
     assert (await client.get("/v1/models", headers={"Authorization": "Bearer local-secret"})).status == 200
     assert (await client.get("/v1/models", headers={"x-api-key": "local-secret"})).status == 200
+
+
+async def broken_upstream(aiohttp_server, first_bytes: list[bytes], then_ok: int):
+    """An upstream whose first `len(first_bytes)` calls send 200 and these bytes, then reset the
+    connection; the calls after that answer with a JSON body. Returns (server, calls)."""
+    from aiohttp import web
+
+    calls: list[int] = []
+
+    async def chat(req: web.Request) -> web.StreamResponse:
+        calls.append(1)
+        if len(calls) <= len(first_bytes):
+            resp = web.StreamResponse()
+            await resp.prepare(req)
+            await resp.write(first_bytes[len(calls) - 1])
+            await asyncio.sleep(0.05)
+            assert req.transport
+            req.transport.abort()
+            return resp
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    return await aiohttp_server(app), calls
+
+
+async def test_retries_when_the_connection_breaks_before_the_answer(
+    aiohttp_client, aiohttp_server, monkeypatch, config
+):
+    """The balancer starts a slow request's 200 with padding; a reset after only that is retried
+    and the answer continues the same response."""
+    upstream, calls = await broken_upstream(aiohttp_server, [b" ", b"  "], then_ok=1)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.post("/v1/chat/completions", json={})
+    body = await resp.text()  # the headers come first; the retries happen while the body is read
+    assert resp.status == 200 and len(calls) == 3
+    assert json.loads(body) == {"ok": True}
+
+
+async def test_retries_an_event_stream_that_only_sent_keepalives(aiohttp_client, aiohttp_server, monkeypatch, config):
+    upstream, calls = await broken_upstream(aiohttp_server, [b": keepalive\n\n"], then_ok=1)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.post("/v1/chat/completions", json={})
+    body = await resp.text()
+    assert len(calls) == 2 and body.startswith(": keepalive") and json.loads(body.split("\n\n", 1)[1]) == {"ok": True}
+
+
+async def test_does_not_retry_after_part_of_the_answer(aiohttp_client, aiohttp_server, monkeypatch, config):
+    upstream, calls = await broken_upstream(aiohttp_server, [b'{"choices": [{"mess'], then_ok=1)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.post("/v1/chat/completions", json={})
+    with contextlib.suppress(aiohttp.ClientPayloadError):  # the client sees the cut-off body too
+        await resp.text()
+    assert len(calls) == 1
+
+
+async def test_gives_up_with_an_error_body_after_only_padding(aiohttp_client, aiohttp_server, monkeypatch, config):
+    upstream, calls = await broken_upstream(aiohttp_server, [b" "] * 4, then_ok=0)
+    client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
+    resp = await client.post("/v1/chat/completions", json={})
+    body = await resp.text()
+    assert resp.status == 200 and len(calls) == 4
+    assert "unreachable" in json.loads(body)["error"]["message"]

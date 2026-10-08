@@ -6,6 +6,7 @@ the event topic, so local clients can keep http://127.0.0.1:<port>/v1.
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import signal
@@ -40,7 +41,21 @@ CLIENT = web.AppKey("client", aiohttp.ClientSession)
 
 
 class Retryable(Exception):
-    """A transient upstream status (502 while the tunnel reconnects, 524, ...)."""
+    """A transient upstream status (502 while the tunnel reconnects, 524, ...), or the connection
+    breaking before any real byte reached the client. Then `resp` is the client response that was
+    already started (with only padding sent): the next attempt continues it."""
+
+    def __init__(self, message: str, resp: web.StreamResponse | None = None) -> None:
+        super().__init__(message)
+        self.resp = resp
+
+
+KEEPALIVE = b": keepalive\n\n"  # what the balancer sends while a request waits: an SSE comment, or a space
+
+
+def padding_only(chunk: bytes) -> bool:
+    """True if `chunk` is the balancer's keepalive padding, not part of the answer."""
+    return not chunk.replace(KEEPALIVE, b"").strip()
 
 
 TUNNEL_DOWN = 530  # Cloudflare: no tunnel is registered for the hostname
@@ -146,20 +161,27 @@ def make_app(
         headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
         headers["Authorization"] = f"Bearer {secrets.api_key}"
         start, status = time.time(), 0
+        started: web.StreamResponse | None = None  # the client response, once the balancer's padding began it
         try:
             for attempt in range(retry.ATTEMPTS):
                 last = attempt == retry.ATTEMPTS - 1
                 try:
-                    resp = await forward(req, f"{upstream.url}{req.rel_url}", headers, retry_status=not last)
+                    resp = await forward(req, f"{upstream.url}{req.rel_url}", headers, not last, started)
                     status = resp.status
                     upstream.reached(status != TUNNEL_DOWN)
                     return resp
                 except (aiohttp.ClientConnectionError, TimeoutError, Retryable) as e:
+                    started = (e.resp if isinstance(e, Retryable) else None) or started
                     if last:
                         log.warning("Kaggle server unreachable: %s", e)
                         upstream.reached(False)
                         status = 502
-                        return web.json_response(api_error(f"Kaggle server unreachable: {e}"), status=502)
+                        message = api_error(f"Kaggle server unreachable: {e}")
+                        if started:  # the 200 is out already: the error goes in its body, as the balancer does
+                            await started.write(json.dumps(message).encode())
+                            await started.write_eof()
+                            return started
+                        return web.json_response(message, status=502)
                     delay = retry.backoff(attempt)
                     log.warning(
                         "%s %s: %s; retry %d/%d in %.1fs",
@@ -177,24 +199,41 @@ def make_app(
         finally:
             log.info("%s %s %s %.2fs", req.method, req.path, status or "-", time.time() - start)
 
-    async def forward(req: web.Request, url: str, headers: dict[str, str], retry_status: bool) -> web.StreamResponse:
+    async def forward(
+        req: web.Request,
+        url: str,
+        headers: dict[str, str],
+        retry_status: bool,
+        resp: web.StreamResponse | None = None,
+    ) -> web.StreamResponse:
         """Stream one upstream response. Errors before the response starts are raised (and
-        retried); once bytes reach the client, a broken upstream just ends the response."""
+        retried), and so is a break after only the balancer's keepalive padding: `resp` is then
+        the response that padding started, which this attempt continues (its own status is
+        dropped; the balancer puts errors in the body of a 200 too). Once real bytes reach the
+        client, a broken upstream just ends the response."""
         async with req.app[CLIENT].request(req.method, url, data=await req.read(), headers=headers) as up:
             if retry_status and up.status in retry.RETRY_STATUS:
-                raise Retryable(f"HTTP {up.status}")
-            resp = web.StreamResponse(
-                status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in HOP_HEADERS}
-            )
-            await resp.prepare(req)
+                raise Retryable(f"HTTP {up.status}", resp)
+            if resp is None:
+                resp = web.StreamResponse(
+                    status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in HOP_HEADERS}
+                )
+                await resp.prepare(req)
+            answering = False  # a real byte has been sent
             try:
                 async for chunk in up.content.iter_any():
+                    answering = answering or not padding_only(chunk)
                     await resp.write(chunk)
                 await resp.write_eof()
             except ConnectionResetError:  # client went away mid-stream; closing upstream stops generation
                 pass
             except (aiohttp.ClientError, TimeoutError) as e:
+                if retry_status and not answering:
+                    raise Retryable(f"upstream broke before answering: {e}", resp) from e
                 log.warning("%s %s: upstream broke mid-response: %s", req.method, req.path, e)
+                if not answering:  # out of retries with only padding sent: an error body, not an empty one
+                    await resp.write(json.dumps(api_error(f"Kaggle server unreachable: {e}")).encode())
+                    await resp.write_eof()
             return resp
 
     async def lifecycle(app: web.Application) -> AsyncIterator[None]:
