@@ -144,3 +144,20 @@ def test_a_success_stops_the_clock():
 @pytest.fixture(autouse=True)
 def _no_real_sleep_in_proxy(monkeypatch):
     monkeypatch.setattr(proxy.retry, "ATTEMPTS", 2)
+
+
+async def test_admin_client_sends_its_own_user_agent(aiohttp_server):
+    """urllib's default User-Agent is rejected by Cloudflare in front of a named tunnel."""
+    from kis.client import USER_AGENT, AdminClient
+
+    seen = []
+
+    async def health(req: web.Request) -> web.Response:
+        seen.append(req.headers.get("User-Agent"))
+        return web.json_response({})
+
+    app = web.Application()
+    app.router.add_post("/admin/shutdown", health)
+    url = str((await aiohttp_server(app)).make_url("")).rstrip("/")
+    await asyncio.to_thread(AdminClient(url, "key").shutdown, "abc")
+    assert seen == [USER_AGENT]
