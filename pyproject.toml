@@ -1,6 +1,6 @@
 [project]
 name = "kis"
-version = "1.2.0"
+version = "1.3.0"
 description = "llama.cpp on free Kaggle GPUs behind a local OpenAI-compatible endpoint"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.9", "kaggle>=1.7"]
