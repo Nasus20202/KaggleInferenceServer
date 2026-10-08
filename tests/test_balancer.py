@@ -1,8 +1,9 @@
-"""Kaggle-side balancer (kaggle/server.py) against fake llama-server instances."""
+"""Kaggle-side balancer (kaggle/balancer.py) against fake llama-server instances."""
 
 import asyncio
 import json
 
+import balancer as balancer_mod
 from kis.schema import GpuStats, Stats, load
 
 AUTH = {"Authorization": "Bearer secret"}
@@ -86,7 +87,7 @@ async def test_shutdown_requires_key_and_sets_stop(aiohttp_client, balancer):
 
 async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server, monkeypatch):
     """Long prompts: bytes start flowing before Cloudflare's first-byte timeout, and clients still parse them."""
-    monkeypatch.setattr(server, "KEEPALIVE_SECONDS", 0.05)  # fake backends answer after 0.2 s
+    monkeypatch.setattr(balancer_mod, "KEEPALIVE_SECONDS", 0.05)  # fake backends answer after 0.2 s
     client = await aiohttp_client(balancer.app())
 
     resp = await client.post("/v1/chat/completions", json={"max_tokens": 4}, headers=AUTH)
@@ -101,7 +102,9 @@ async def test_keepalive_while_backend_is_slow(aiohttp_client, balancer, server,
 
 
 async def test_stats_need_the_key_and_report_gpus_and_requests(aiohttp_client, balancer, server, monkeypatch):
-    monkeypatch.setattr(server, "gpu_stats", lambda: [GpuStats(gpu=0, used_mib=9000, total_mib=15360, util_pct=5)])
+    monkeypatch.setattr(
+        balancer_mod, "gpu_stats", lambda: [GpuStats(gpu=0, used_mib=9000, total_mib=15360, util_pct=5)]
+    )
     client = await aiohttp_client(balancer.app())
     assert (await client.get("/admin/stats")).status == 401
     await client.post("/v1/chat/completions", json={}, headers=AUTH)
@@ -111,7 +114,7 @@ async def test_stats_need_the_key_and_report_gpus_and_requests(aiohttp_client, b
 
 
 async def test_logs_tail_only_log_files(aiohttp_client, balancer, server, monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "WORK", tmp_path)
+    monkeypatch.setattr(balancer_mod, "WORK", tmp_path)
     (tmp_path / "llama-8090.log").write_text("".join(f"line {i}\n" for i in range(10)))
     client = await aiohttp_client(balancer.app())
     resp = await client.get("/admin/logs?file=llama-8090.log&lines=2", headers=AUTH)
@@ -129,7 +132,7 @@ async def test_logs_each_request(aiohttp_client, balancer, caplog):
 
 
 async def test_stats_include_token_usage_per_model(aiohttp_client, balancer, server, monkeypatch, caplog):
-    monkeypatch.setattr(server, "gpu_stats", list)
+    monkeypatch.setattr(balancer_mod, "gpu_stats", list)
     client = await aiohttp_client(balancer.app())
     with caplog.at_level("INFO", logger="kis"):
         for tokens in (3, 5):
