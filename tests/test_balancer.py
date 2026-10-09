@@ -3,6 +3,9 @@
 import asyncio
 import json
 
+from aiohttp import web
+from conftest import FakeBackends, make_balancer
+
 import balancer as balancer_mod
 from kis.schema import GpuStats, Stats, load
 
@@ -153,6 +156,37 @@ async def test_max_queue_answers_429_when_full(aiohttp_client, balancer, server,
     monkeypatch.setattr(server.SETTINGS, "max_queue", None)
     resps = await asyncio.gather(*(client.post("/v1/chat/completions", json={}, headers=AUTH) for _ in range(5)))
     assert {r.status for r in resps} == {200}
+
+
+async def test_retries_once_when_the_backend_drops_the_connection(aiohttp_client, aiohttp_server, server):
+    calls = []
+
+    async def drop_first(req: web.Request) -> web.StreamResponse:
+        calls.append(1)
+        if len(calls) == 1:  # like a keep-alive connection llama-server already closed
+            assert req.transport
+            req.transport.close()
+            await asyncio.sleep(1)
+        return web.json_response({"backend": "gpu0"})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", drop_first)
+    backend = await aiohttp_server(app)
+    bal = make_balancer(server, FakeBackends({server.START: [backend.port]}, server.START))
+    client = await aiohttp_client(bal.app())
+    resp = await client.post("/v1/chat/completions", json={}, headers=AUTH)
+    assert resp.status == 200
+    assert (await resp.json())["backend"] == "gpu0"
+    assert len(calls) == 2
+
+
+async def test_unreachable_backend_answers_502(aiohttp_client, unused_tcp_port, server):
+    bal = make_balancer(server, FakeBackends({server.START: [unused_tcp_port]}, server.START))
+    client = await aiohttp_client(bal.app())
+    resp = await client.post("/v1/chat/completions", json={}, headers=AUTH)
+    assert resp.status == 502  # `kis proxy` retries a 502, not aiohttp's bare 500
+    assert "backend unreachable" in (await resp.json())["error"]["message"]
+    assert bal.inflight == {port: 0 for port in bal.inflight}
 
 
 def chat(*messages, tools=None):
