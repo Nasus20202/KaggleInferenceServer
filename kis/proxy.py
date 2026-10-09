@@ -37,6 +37,7 @@ HOP_HEADERS = {
 
 
 ROLLOVER_MAX_IDLE_S = 300  # an older session idle for longer isn't replaced
+ATTEMPTS = 10  # about a minute of backoff: a failed request can cost a client far more
 CLIENT = web.AppKey("client", aiohttp.ClientSession)
 
 
@@ -163,8 +164,8 @@ def make_app(
         start, status = time.time(), 0
         started: web.StreamResponse | None = None  # the client response, once the balancer's padding began it
         try:
-            for attempt in range(retry.ATTEMPTS):
-                last = attempt == retry.ATTEMPTS - 1
+            for attempt in range(ATTEMPTS):
+                last = attempt == ATTEMPTS - 1
                 try:
                     resp = await forward(req, f"{upstream.url}{req.rel_url}", headers, not last, started)
                     status = resp.status
@@ -189,7 +190,7 @@ def make_app(
                         req.path,
                         e,
                         attempt + 1,
-                        retry.ATTEMPTS - 1,
+                        ATTEMPTS - 1,
                         delay,
                     )
                     await asyncio.sleep(delay)
