@@ -54,8 +54,9 @@ class BackendSet(Protocol):
 def affinity_key(body: bytes) -> str | None:
     """Identifies the conversation of a chat or completion request, so its turns can go to the
     instance that already holds its prompt cache. Only what stays the same from turn to turn
-    counts: the tools, the system messages and the first user message (a hash of the whole
-    history would change every turn). None for anything else."""
+    counts: the tools, the system messages, the first user message and, from the second turn,
+    the first answer, which tells apart conversations that start alike (agents given one task
+    text). None for anything else."""
     if b'"messages"' not in body and b'"prompt"' not in body:
         return None
     try:
@@ -67,7 +68,7 @@ def affinity_key(body: bytes) -> str | None:
     parts: list[Any] = [doc.get("tools")]
     messages = doc.get("messages")
     if isinstance(messages, list):
-        first_user = False
+        first_user = first_answer = False
         for m in messages:
             role = m.get("role") if isinstance(m, dict) else None
             if role in ("system", "developer"):
@@ -75,6 +76,9 @@ def affinity_key(body: bytes) -> str | None:
             elif role == "user" and not first_user:
                 parts.append(m)
                 first_user = True
+            elif role == "assistant" and first_user and not first_answer:
+                parts.append(m)
+                first_answer = True
     elif isinstance(doc.get("prompt"), str):
         parts.append(doc["prompt"][:4096])
     else:
@@ -82,15 +86,18 @@ def affinity_key(body: bytes) -> str | None:
     return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def pick(inflight: dict[int, int], key: str | None, slack: int) -> int:
+def pick(inflight: dict[int, int], key: str | None, slack: int, parallel: int = 0) -> int:
     """The port for a request: the instance `key` hashes to, unless it has more than `slack`
-    requests in flight beyond the least busy one (then the load wins over the cache);
-    without a key, or with a negative slack, the least busy."""
+    requests in flight beyond the least busy one, or all its `parallel` slots busy while the
+    least busy has one free (then the load wins over the cache); without a key, or with a
+    negative slack, the least busy."""
     least = min(inflight, key=lambda p: inflight[p])
     if key is None or slack < 0 or len(inflight) < 2:
         return least
     ports = sorted(inflight)
     preferred = ports[int(key, 16) % len(ports)]
+    if parallel and inflight[preferred] >= parallel > inflight[least]:
+        return least
     return preferred if inflight[preferred] - inflight[least] <= slack else least
 
 
@@ -424,7 +431,7 @@ class Balancer:
         await self.ensure(name)
         if not self.inflight:
             raise SwapFailed(self.failure or "no model loaded")
-        port = pick(self.inflight, key, self.settings.sticky_slack)
+        port = pick(self.inflight, key, self.settings.sticky_slack, self.runtime.parallel)
         self.inflight[port] += 1
         return port
 

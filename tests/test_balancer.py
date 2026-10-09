@@ -196,13 +196,19 @@ def chat(*messages, tools=None):
 SYSTEM = {"role": "system", "content": "You fix clusters."}
 
 
-def test_affinity_key_is_the_same_for_every_turn_of_a_conversation():
+def test_affinity_key_is_the_same_from_the_second_turn_of_a_conversation():
     first = {"role": "user", "content": "pod is pending"}
-    turn1 = chat(SYSTEM, first)
-    turn2 = chat(
-        SYSTEM, first, {"role": "assistant", "content": "kubectl get pods"}, {"role": "tool", "content": "..."}
-    )
-    assert balancer_mod.affinity_key(turn1) == balancer_mod.affinity_key(turn2) is not None
+    answer = {"role": "assistant", "content": "kubectl get pods"}
+    turn2 = chat(SYSTEM, first, answer, {"role": "tool", "content": "..."})
+    turn3 = chat(SYSTEM, first, answer, {"role": "tool", "content": "..."}, {"role": "assistant", "content": "x"})
+    assert balancer_mod.affinity_key(turn2) == balancer_mod.affinity_key(turn3) is not None
+
+
+def test_affinity_key_tells_apart_conversations_with_one_task_text():
+    first = {"role": "user", "content": "restore the application"}
+    a = chat(SYSTEM, first, {"role": "assistant", "content": "kubectl get pods"})
+    b = chat(SYSTEM, first, {"role": "assistant", "content": "kubectl get svc"})
+    assert balancer_mod.affinity_key(a) != balancer_mod.affinity_key(b)
 
 
 def test_affinity_key_differs_between_conversations_and_tool_sets():
@@ -227,6 +233,8 @@ def test_pick_prefers_the_hashed_instance_until_the_load_differs_too_much():
     assert balancer_mod.pick({8090: 0, 8091: 0}, key, -1) == 8090  # off: least busy (the first on a tie)
     assert balancer_mod.pick({8090: 3, 8091: 0}, None, 4) == 8091  # no key: least busy
     assert balancer_mod.pick({8090: 7}, key, 4) == 8090  # one instance
+    assert balancer_mod.pick({8090: 2, 8091: 4}, key, 4, parallel=4) == 8090  # preferred full, the other is not
+    assert balancer_mod.pick({8090: 4, 8091: 4}, key, 4, parallel=4) == 8091  # both full: the cache wins
 
 
 async def test_turns_of_one_conversation_reach_the_same_instance(aiohttp_client, balancer):
@@ -238,8 +246,10 @@ async def test_turns_of_one_conversation_reach_the_same_instance(aiohttp_client,
 
     history = [SYSTEM, {"role": "user", "content": "pod is pending"}]
     seen = set()
-    for i in range(4):
-        seen.add(await turn(*history))
+    for i in range(5):
+        backend = await turn(*history)
+        if i:  # the first turn has no answer to key on yet
+            seen.add(backend)
         history += [{"role": "assistant", "content": f"step {i}"}, {"role": "tool", "content": "ok"}]
     assert len(seen) == 1
     others = {await turn(SYSTEM, {"role": "user", "content": f"task {i}"}) for i in range(8)}
