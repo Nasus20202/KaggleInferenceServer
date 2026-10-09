@@ -340,9 +340,13 @@ class Balancer:
             admitted = True
             headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
             assert self.session, "app() not started"
-            return await self.session.request(
-                req.method, f"http://127.0.0.1:{port}{req.rel_url}", data=body, headers=headers
-            )
+            url = f"http://127.0.0.1:{port}{req.rel_url}"
+            try:
+                return await self.session.request(req.method, url, data=body, headers=headers)
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
+                # Most likely a keep-alive connection llama-server had already closed: once more on a new one.
+                log.warning("%s %s -> :%d: %s; retrying once", req.method, req.path, port, e)
+                return await self.session.request(req.method, url, data=body, headers=headers)
 
         try:
             body = await req.read()
@@ -619,6 +623,10 @@ class Balancer:
                 upstream = pending.result()
             except SwapFailed as e:
                 return await self.unavailable(req, resp, sse, str(e)), sse, captured
+            except aiohttp.ClientConnectionError as e:  # retried by `kis proxy`, unlike a bare 500
+                log.warning("%s %s: backend unreachable: %s", req.method, req.path, e)
+                message = f"backend unreachable: {e}"
+                return await self.unavailable(req, resp, sse, message, status=502), sse, captured
             if resp is None:
                 resp = web.StreamResponse(
                     status=upstream.status,
@@ -644,12 +652,12 @@ class Balancer:
 
     @staticmethod
     async def unavailable(
-        req: web.Request, resp: web.StreamResponse | None, sse: bool, message: str
+        req: web.Request, resp: web.StreamResponse | None, sse: bool, message: str, status: int = 503
     ) -> web.StreamResponse:
-        """A 503 error, or with keepalive bytes already sent, the error as the body of that 200."""
+        """A 503 (or `status`) error, or with keepalive bytes already sent, the error as the body of that 200."""
         error = json.dumps(api_error(message, type="unavailable")).encode()
         if resp is None:
-            return web.Response(body=error, status=503, content_type="application/json")
+            return web.Response(body=error, status=status, content_type="application/json")
         await resp.write(b"data: " + error + b"\n\n" if sse else error)
         await resp.write_eof()
         return resp
