@@ -169,9 +169,9 @@ async def test_does_not_retry_after_part_of_the_answer(aiohttp_client, aiohttp_s
 
 
 async def test_gives_up_with_an_error_body_after_only_padding(aiohttp_client, aiohttp_server, monkeypatch, config):
-    upstream, calls = await broken_upstream(aiohttp_server, [b" "] * 4, then_ok=0)
+    upstream, calls = await broken_upstream(aiohttp_server, [b" "] * proxy.ATTEMPTS, then_ok=0)
     client = await make_client(aiohttp_client, monkeypatch, config, str(upstream.make_url("")).rstrip("/"))
     resp = await client.post("/v1/chat/completions", json={})
     body = await resp.text()
-    assert resp.status == 200 and len(calls) == 4
+    assert resp.status == 200 and len(calls) == proxy.ATTEMPTS
     assert "unreachable" in json.loads(body)["error"]["message"]

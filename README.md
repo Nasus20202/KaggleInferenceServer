@@ -55,7 +55,7 @@ By default, any client on your machine can use the proxy. Set `KIS_PROXY_API_KEY
 
 A quick tunnel can lose its registration while `cloudflared` keeps running (clients then get 530, later no DNS). The server checks its own public URL every 30 s and restarts `cloudflared` after 3 failed checks, which announces a new URL that the proxy follows. Set `KIS_PROXY_GIVE_UP_MINUTES=10` to make the proxy exit once the server has been unreachable that long, so that CI jobs fail fast instead of retrying a dead URL.
 
-The proxy retries transient failures with exponential backoff and jitter: a dropped connection, or a 502/503/504/524 while the tunnel reconnects. It re-reads the endpoint between retries and only retries before any bytes have reached the client. `kis` commands retry Kaggle, ntfy and server calls the same way.
+The proxy retries transient failures for about a minute, with exponential backoff and jitter: a dropped connection, or a 502/503/504/524 while the tunnel reconnects. It re-reads the endpoint between retries and only retries before any bytes have reached the client. `kis` commands retry Kaggle, ntfy and server calls the same way.
 
 **5. Measure and stop**
 
