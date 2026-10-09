@@ -1,7 +1,7 @@
 # kis client: proxy, up/down/bench and the Kaggle CLI. The GPU side runs on Kaggle.
 FROM python:3.14.8-slim
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never PYTHONUNBUFFERED=1
 
 RUN useradd --create-home --uid 1000 kis
