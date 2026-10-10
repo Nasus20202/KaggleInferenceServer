@@ -92,3 +92,16 @@ def test_logs_file_says_why_the_server_cannot_be_read(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         cli.cmd_logs(argparse.Namespace(file="server.log", lines=3, since="1h"), None)  # type: ignore[arg-type]
     assert "cannot read server.log from https://llm.example.com: certificate verify failed" in str(e.value)
+
+
+def test_follow_reports_the_kernel_state_until_it_ends(monkeypatch, config, capsys):
+    from kis import cli, kaggle
+
+    states = iter([kaggle.KernelState.QUEUED, kaggle.KernelState.QUEUED, kaggle.KernelState.ERROR])
+    monkeypatch.setattr(cli.events, "fetch", lambda *a: [])
+    monkeypatch.setattr(cli.kaggle, "state", lambda *a: next(states))
+    monkeypatch.setattr(cli, "KERNEL_CHECK_S", -1)
+    monkeypatch.setattr(cli, "EVENT_POLL_S", 0)
+    with pytest.raises(SystemExit, match="kernel ended: error"):
+        cli.follow(config, "topic", "0", until_ready=True, slug="kis-server")
+    assert capsys.readouterr().out.count("kernel: queued") == 1
