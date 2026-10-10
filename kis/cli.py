@@ -143,7 +143,7 @@ def follow(
     slug: str = "",
 ) -> None:
     """Print events (of one session, if given); with until_ready, return on `ready` and exit on failure."""
-    last_status_check = time.time()
+    last_status_check, last_state = time.time(), None
     while True:
         for msg_id, event in events.fetch(config.ntfy, topic, since):
             since = msg_id
@@ -160,6 +160,9 @@ def follow(
             state = kaggle.state(config, slug or kaggle.SERVER)
             if state.ended:
                 sys.exit(f"kernel ended: {state}")
+            if state != last_state:  # e.g. queued for a GPU, which no event reports
+                print(f"kernel: {state}")
+                last_state = state
         time.sleep(EVENT_POLL_S)
 
 
