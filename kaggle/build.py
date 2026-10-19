@@ -11,7 +11,7 @@ import subprocess
 
 # <params> (replaced by `kis build`)
 # renovate: datasource=github-releases depName=ggml-org/llama.cpp
-LLAMA_CPP_REF = "v0.6.0"
+LLAMA_CPP_REF = "v0.7.0"
 # </params>
 
 SRC, OUT = "/tmp/llama.cpp", "/kaggle/working/bin"
