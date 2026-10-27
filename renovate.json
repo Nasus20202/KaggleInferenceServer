@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", ":semanticCommits"],
+  "extends": ["github>Nasus20202/renovate"],
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true
