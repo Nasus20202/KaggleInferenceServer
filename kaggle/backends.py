@@ -15,7 +15,16 @@ import time
 import urllib.request
 from collections.abc import Callable
 
-from common import fetch, gpu_stats, llama_command, llama_server_binary  # inlined by `kis`
+from common import (  # inlined by `kis`
+    Paths,
+    Source,
+    fetch,
+    gpu_stats,
+    llama_command,
+    llama_server_binary,
+    model_paths,
+    sources,
+)
 from kis.schema import EventType, Model, ServerConfig, Topology, dump  # inlined by `kis`
 from state import WORK, Runtime, log, log_file  # inlined by `kis`
 
@@ -26,28 +35,26 @@ FETCHED: dict[str, str] = {}  # repo@revision/file -> local path, downloaded and
 FETCH_LOCKS: dict[str, threading.Lock] = {}  # one download of a file at a time (prefetch and swaps)
 
 
-def _file_key(model: Model, file: str) -> str:
-    return f"{model.repo}@{model.revision}/{file}"
+def _file_key(source: Source) -> str:
+    return f"{source.repo}@{source.revision}/{source.file}"
 
 
-def _fetch_once(model: Model, file: str, sha256: str | None) -> str:
-    key = _file_key(model, file)
+def _fetch_once(source: Source) -> str:
+    key = _file_key(source)
     with FETCH_LOCKS.setdefault(key, threading.Lock()):
         if key not in FETCHED:
-            FETCHED[key] = fetch(model, file, sha256)
+            FETCHED[key] = fetch(source)
         return FETCHED[key]
 
 
-def model_files(model: Model) -> tuple[str, str | None]:
-    """Local paths of a preset's model and draft. Each file is downloaded and its sha256
+def model_files(model: Model) -> Paths:
+    """Local paths of a preset's model, draft and adapter. Each file is downloaded and its sha256
     checked once per session: hashing the 27B again would add a minute to every swap."""
-    draft = _fetch_once(model, model.draft_file, model.draft_sha256) if model.draft_file else None
-    return _fetch_once(model, model.file, model.sha256), draft
+    return model_paths(model, _fetch_once)
 
 
 def downloaded(model: Model) -> bool:
-    files = [model.file] + ([model.draft_file] if model.draft_file else [])
-    return all(_file_key(model, f) in FETCHED for f in files)
+    return all(_file_key(s) in FETCHED for s in sources(model) if s)
 
 
 def prefetch(names: list[str], presets: dict[str, Model]) -> None:
@@ -66,7 +73,7 @@ server_binary = functools.cache(llama_server_binary)
 def launch(
     binary: str,
     model: Model,
-    paths: tuple[str, str | None],
+    paths: Paths,
     port: int,
     gpu_ids: list[str],
     parallel: int,

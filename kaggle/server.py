@@ -28,6 +28,7 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -64,6 +65,7 @@ CONFIG = {
     "prefetch": [],
     "resident": [],
     "ntfy": {"server": "https://ntfy.sh", "token": ""},
+    "huggingface": {"token": ""},
     "ntfy_topic": "",
     "session": "",
     "notify": {"topic": "", "token": "", "server": ""},
@@ -82,6 +84,8 @@ SETTINGS = load(ServerConfig, CONFIG)  # checked and typed; see kis/schema.py fo
 MODEL = SETTINGS.model  # loaded first
 PRESETS = SETTINGS.models or {SETTINGS.preset or MODEL.alias: MODEL}  # name -> preset the session can load
 START = SETTINGS.preset if SETTINGS.preset in PRESETS else next(iter(PRESETS))
+if SETTINGS.huggingface.token:
+    os.environ["HF_TOKEN"] = SETTINGS.huggingface.token  # for private repositories (adapters)
 STATS_MINUTES = 10  # heartbeat with GPU and request stats on the ntfy topic
 
 

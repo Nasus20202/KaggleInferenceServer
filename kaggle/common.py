@@ -16,7 +16,9 @@ import subprocess
 import threading
 import time
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from kis.schema import CpuStats, Event, GpuStats, Model, Ntfy, RamStats
 
@@ -52,12 +54,49 @@ def llama_server_binary() -> str:
     return "/tmp/llama-server"
 
 
-def fetch(model: Model, file: str, sha256: str | None = None) -> str:
-    """Download one file of a model preset from Hugging Face; check its sha256 if given."""
+class Source(NamedTuple):
+    """A file on Hugging Face and its checksum."""
+
+    repo: str
+    revision: str | None
+    file: str
+    sha256: str | None
+
+
+class Paths(NamedTuple):
+    """The local files of a preset: the model, its MTP draft model and its LoRA adapter."""
+
+    model: str
+    draft: str | None = None
+    lora: str | None = None
+
+
+def sources(model: Model) -> tuple[Source, Source | None, Source | None]:
+    """Where a preset's model, draft and adapter come from. The draft is in the model's
+    repository; the adapter has a repository of its own, or is in the model's."""
+    main = Source(model.repo, model.revision, model.file, model.sha256)
+    draft = Source(model.repo, model.revision, model.draft_file, model.draft_sha256) if model.draft_file else None
+    lora = None
+    if model.lora_file:
+        revision = model.lora_revision or (None if model.lora_repo else model.revision)
+        lora = Source(model.lora_repo or model.repo, revision, model.lora_file, model.lora_sha256)
+    return main, draft, lora
+
+
+def model_paths(model: Model, get: Callable[[Source], str] | None = None) -> Paths:
+    """Fetch a preset's files with `get` (default: fetch)."""
+    get = get or fetch
+    main, draft, lora = sources(model)
+    return Paths(get(main), get(draft) if draft else None, get(lora) if lora else None)
+
+
+def fetch(source: Source) -> str:
+    """Download one file from Hugging Face (HF_TOKEN reaches a private repository); check its sha256 if given."""
     from huggingface_hub import hf_hub_download  # pyright: ignore[reportMissingImports]  (on Kaggle)
 
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    path: str = hf_hub_download(model.repo, file, revision=model.revision, local_dir=MODELS_DIR)
+    file, sha256 = source.file, source.sha256
+    path: str = hf_hub_download(source.repo, file, revision=source.revision, local_dir=MODELS_DIR)
     if sha256:
         digest = hashlib.sha256()
         with open(path, "rb") as f:
@@ -270,7 +309,7 @@ def memory_options(args: list[str]) -> list[str]:
 def llama_command(
     binary: str,
     model: Model,
-    paths: tuple[str, str | None],
+    paths: Paths,
     port: int,
     gpus: list[str],
     parallel: int,
@@ -281,11 +320,13 @@ def llama_command(
     of `ctx` tokens each (KV pool = parallel x ctx): `args` for every model, then the preset's, then
     the RAM limits they leave out (see memory_options).
     No web UI: the balancer requires an API key on every route, which a browser doesn't send."""
-    model_path, draft_path = paths
+    model_path, draft_path, lora_path = paths
     cmd = [binary, "-m", model_path, "--host", "127.0.0.1", "--port", str(port), "--alias", model.alias, "--no-webui"]
     cmd += ["--parallel", str(parallel), "--kv-unified-per-slot", str(ctx)]
     if draft_path:
         cmd += ["--model-draft", draft_path]
+    if lora_path:
+        cmd += ["--lora", lora_path]
     if len(gpus) > 1:
         cmd += ["--split-mode", "layer", "--tensor-split", model.tensor_split or ",".join("1" * len(gpus))]
     cmd += args + model.args

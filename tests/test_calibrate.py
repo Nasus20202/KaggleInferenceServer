@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from common import Paths
 from kis import kaggle
 from kis.schema import Calibration, Model, Topology, load
 
@@ -25,7 +26,7 @@ def calibrate():
 
 def fake_tester(calibrate, budget: int, n_ctx_train: int = 262144):
     """A Tester whose attempts fit while parallel x ctx <= budget tokens; records attempts."""
-    t = calibrate.Tester("llama-server", MODEL, ("m.gguf", None), ["0"], 8090)
+    t = calibrate.Tester("llama-server", MODEL, Paths("m.gguf"), ["0"], 8090)
     t.n_ctx_train, t.tries = n_ctx_train, []
     t.attempt = lambda parallel, ctx: (
         t.tries.append((parallel, ctx)) or ({"0": 1000} if parallel * ctx <= budget else None)
@@ -72,7 +73,7 @@ def run_calibrate(calibrate, monkeypatch, size_gb: float, budget_per_gpu: int, n
 
     monkeypatch.setattr(calibrate.Tester, "attempt", attempt)
     monkeypatch.setattr(calibrate.Tester, "bench", lambda self, p, c: calibrate.Speed(40.0, 10.0 * p))
-    monkeypatch.setattr(calibrate, "fetch", lambda model, file: file)
+    monkeypatch.setattr(calibrate, "model_paths", lambda model: Paths(model.file))
     monkeypatch.setattr(calibrate.os.path, "getsize", lambda p: size_gb * 1e9)
     monkeypatch.setattr(calibrate.os, "remove", lambda p: None)
     monkeypatch.setattr(calibrate, "notify", lambda event, **data: events.append(data))

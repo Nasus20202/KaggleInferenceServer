@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .schema import Calibration, Model, Notify, Ntfy, SchemaError, ServerConfig, Tunnel, dump, load
+from .schema import Calibration, HuggingFace, Model, Notify, Ntfy, SchemaError, ServerConfig, Tunnel, dump, load
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / ".kis"
@@ -50,6 +50,7 @@ class Config:
     models: dict[str, Model]
     tunnel: Tunnel = field(default_factory=Tunnel)
     ntfy: Ntfy = field(default_factory=Ntfy)
+    huggingface: HuggingFace = field(default_factory=HuggingFace)
     notify: Notify = field(default_factory=Notify)
     server: Server = field(default_factory=Server)
 

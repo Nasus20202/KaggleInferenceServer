@@ -150,6 +150,14 @@ class Tunnel:
 
 
 @dataclass(frozen=True)
+class HuggingFace:
+    """Access token for private Hugging Face repositories (a preset's adapter, say). The kernel
+    sets it as HF_TOKEN; read access is enough."""
+
+    token: str = ""
+
+
+@dataclass(frozen=True)
 class Model:
     """A model preset: GGUF files on Hugging Face and how to serve them."""
 
@@ -161,6 +169,10 @@ class Model:
     sha256: str | None = None
     draft_file: str | None = None  # MTP draft model in the same repo
     draft_sha256: str | None = None
+    lora_file: str | None = None  # LoRA adapter GGUF, loaded next to the unchanged model file
+    lora_sha256: str | None = None
+    lora_repo: str | None = None  # default: repo; an adapter usually has a repository of its own
+    lora_revision: str | None = None  # of lora_repo; default: revision when the adapter is in repo
     ctx: int | None = None  # tokens per slot; default: server.ctx
     topology: Topology | None = None  # default: by file size and replica_max_gb
     tensor_split: str | None = None  # split topology: layers per GPU, e.g. "5,4"
@@ -179,6 +191,7 @@ class ServerConfig:
     prefetch: list[str] = field(default_factory=list)  # presets downloaded in the background after startup
     resident: list[str] = field(default_factory=list)  # presets served on GPU 0 for the whole session, never swapped
     ntfy: Ntfy = field(default_factory=Ntfy)
+    huggingface: HuggingFace = field(default_factory=HuggingFace)
     ntfy_topic: str = ""  # private control topic: events and the endpoint
     session: str = ""  # id in every event; `kis` tells sessions apart during a rollover
     notify: Notify = field(default_factory=Notify)
@@ -200,6 +213,7 @@ class CalibrateConfig:
     models: dict[str, Model]
     args: list[str] = field(default_factory=list)
     ntfy: Ntfy = field(default_factory=Ntfy)
+    huggingface: HuggingFace = field(default_factory=HuggingFace)
     ntfy_topic: str = ""
     replica_max_gb: float = 11.0
 

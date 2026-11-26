@@ -4,13 +4,14 @@ import dataclasses
 import json
 
 import common
+from common import Paths
 from kis.schema import CpuStats, Event, EventType, GpuStats, Model, Ntfy, RamStats, Stats, Topology, UsageSummary, dump
 
 MODEL = Model(repo="r", file="m.gguf", alias="m", parallel=1, args=["--temp", "1.0"])
 
 
 def test_replica_command():
-    cmd, env = common.llama_command("llama-server", MODEL, ("m.gguf", None), 8090, ["1"], 4, 65536, ["--metrics"])
+    cmd, env = common.llama_command("llama-server", MODEL, Paths("m.gguf"), 8090, ["1"], 4, 65536, ["--metrics"])
     assert cmd == [
         "llama-server", "-m", "m.gguf", "--host", "127.0.0.1", "--port", "8090", "--alias", "m",
         "--no-webui", "--parallel", "4", "--kv-unified-per-slot", "65536", "--metrics", "--temp", "1.0",
@@ -21,10 +22,32 @@ def test_replica_command():
 
 def test_split_command_with_draft_and_tensor_split():
     model = dataclasses.replace(MODEL, tensor_split="5,4")
-    cmd, env = common.llama_command("llama-server", model, ("m.gguf", "d.gguf"), 8090, ["0", "1"], 1, 32768, [])
+    cmd, env = common.llama_command("llama-server", model, Paths("m.gguf", "d.gguf"), 8090, ["0", "1"], 1, 32768, [])
     assert cmd[cmd.index("--model-draft") + 1] == "d.gguf"
     assert cmd[cmd.index("--tensor-split") + 1] == "5,4" and "--split-mode" in cmd
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_adapter_is_loaded_next_to_the_model():
+    cmd, _ = common.llama_command("llama-server", MODEL, Paths("m.gguf", lora="a.gguf"), 8090, ["1"], 1, 32768, [])
+    assert cmd[cmd.index("--lora") + 1] == "a.gguf" and cmd[cmd.index("-m") + 1] == "m.gguf"
+    assert "--lora" not in common.llama_command("llama-server", MODEL, Paths("m.gguf"), 8090, ["1"], 1, 32768, [])[0]
+
+
+def test_adapter_comes_from_its_own_repository_or_the_models():
+    model = dataclasses.replace(MODEL, revision="rev", draft_file="d.gguf", lora_file="a.gguf", lora_sha256="ab" * 32)
+    main, draft, lora = common.sources(model)
+    assert draft and (main.repo, main.revision, draft.file) == ("r", "rev", "d.gguf")
+    assert lora == common.Source("r", "rev", "a.gguf", "ab" * 32)  # in the model's repository
+    own = dataclasses.replace(model, lora_repo="me/adapter", lora_revision="adapterrev")
+    assert common.sources(own)[2] == common.Source("me/adapter", "adapterrev", "a.gguf", "ab" * 32)
+    assert common.sources(MODEL)[1:] == (None, None)
+
+
+def test_model_paths_fetches_each_file_once_in_order():
+    model = dataclasses.replace(MODEL, lora_file="a.gguf", lora_repo="me/adapter", lora_revision="x")
+    paths = common.model_paths(model, lambda s: f"/dl/{s.repo}/{s.file}")
+    assert paths == Paths("/dl/r/m.gguf", None, "/dl/me/adapter/a.gguf")
 
 
 def test_gpu_stats_survive_a_missing_nvidia_smi(monkeypatch):
@@ -159,7 +182,7 @@ def test_cpu_meter_reports_use_between_two_readings(tmp_path, monkeypatch):
 
 def command(*args: str, model_args: tuple[str, ...] = ()) -> list[str]:
     model = dataclasses.replace(MODEL, args=list(model_args))
-    return common.llama_command("llama-server", model, ("m.gguf", None), 8090, ["0"], 1, 32768, list(args))[0]
+    return common.llama_command("llama-server", model, Paths("m.gguf"), 8090, ["0"], 1, 32768, list(args))[0]
 
 
 def test_ram_limits_default_to_what_kaggle_can_hold():
