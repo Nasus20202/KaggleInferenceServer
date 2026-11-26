@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar
 
-from common import fetch, gpu_stats, llama_command, llama_server_binary, publish  # inlined by `kis`
+from common import Paths, gpu_stats, llama_command, llama_server_binary, model_paths, publish  # inlined by `kis`
 from kis.schema import (  # inlined by `kis`
     MAX_PROFILE,
     PROFILE_CTX,
@@ -46,6 +46,8 @@ CONFIG = {"run": "", "models": {}}
 # </params>
 
 SETTINGS = load(CalibrateConfig, CONFIG)  # checked and typed; see kis/schema.py
+if SETTINGS.huggingface.token:
+    os.environ["HF_TOKEN"] = SETTINGS.huggingface.token  # for private repositories (adapters)
 R = TypeVar("R")
 
 PROFILES = PROFILE_CTX
@@ -110,7 +112,7 @@ class Speed:
 class Tester:
     """Starts llama-server for one model on one GPU group."""
 
-    def __init__(self, binary: str, model: Model, paths: tuple[str, str | None], gpus: list[str], port: int) -> None:
+    def __init__(self, binary: str, model: Model, paths: Paths, gpus: list[str], port: int) -> None:
         self.binary, self.model, self.paths, self.gpus, self.port = binary, model, paths, gpus, port
         self.n_ctx_train: int | None = None
         self.url = f"http://127.0.0.1:{port}"
@@ -221,7 +223,7 @@ def in_parallel(*jobs: Callable[[], R]) -> list[R]:
 
 
 def calibrate(binary: str, gpus: list[str], name: str, model: Model) -> None:
-    paths = (fetch(model, model.file), fetch(model, model.draft_file) if model.draft_file else None)
+    paths = model_paths(model)
     size_gb = sum(os.path.getsize(p) for p in paths if p) / 1e9
     split = Tester(binary, model, paths, gpus, 8092)
     replicas = model.topology != Topology.SPLIT and size_gb <= SETTINGS.replica_max_gb

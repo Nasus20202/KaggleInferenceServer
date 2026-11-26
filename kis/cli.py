@@ -86,6 +86,7 @@ def server_config(args: argparse.Namespace, config: Config, secrets: Secrets) ->
         prefetch=[n for n in server.prefetch if n != args.model and n not in server.resident],
         resident=server.resident,
         ntfy=config.ntfy,
+        huggingface=config.huggingface,
         ntfy_topic=secrets.ntfy_topic,
         notify=config.notify,
         tunnel=config.tunnel,
@@ -248,6 +249,7 @@ def cmd_calibrate(args: argparse.Namespace, config: Config) -> None:
         models={n: config.models[n] for n in names},
         args=_drop_options(config.server.args, *SLOT_OPTIONS),
         ntfy=config.ntfy,
+        huggingface=config.huggingface,
         ntfy_topic=topic,
         replica_max_gb=config.server.replica_max_gb,
     )

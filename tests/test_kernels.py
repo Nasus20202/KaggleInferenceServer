@@ -79,11 +79,14 @@ def test_build_render_sets_ref():
 def test_presets_are_complete(config):
     for name, preset in config.models.items():
         assert preset.revision, f"{name}: unpinned revision"
-        for digest in (preset.sha256, preset.draft_sha256):
+        for digest in (preset.sha256, preset.draft_sha256, preset.lora_sha256):
             if digest is not None:
                 assert re.fullmatch(r"[0-9a-f]{64}", digest), f"{name}: bad sha256"
         if preset.draft_file:
             assert preset.draft_sha256, f"{name}: unpinned draft"
+        if preset.lora_file:
+            assert preset.lora_sha256, f"{name}: unpinned adapter"
+            assert preset.lora_revision or not preset.lora_repo, f"{name}: unpinned adapter revision"
 
 
 def test_every_example_config_loads():

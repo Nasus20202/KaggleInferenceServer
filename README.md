@@ -244,6 +244,26 @@ Calibration stops at 32 slots per llama-server instance, so `gemma-4-e2b` at 32K
 
 Each preset pins a revision and sha256. `kis up <model> --parallel N --ctx N` overrides a preset for one run. After a llama.cpp update, or to add presets, run `kis calibrate --write [model...]`; it regenerates `examples/` and this table.
 
+## LoRA adapters
+
+A preset can load a LoRA adapter (a GGUF converted with llama.cpp's `convert_lora_to_gguf.py`) next to its unchanged base model. The adapter is downloaded and checked like the model, and passed to llama-server with `--lora`; it is always applied, never switched per request.
+
+```toml
+[models.gemma-4-e4b-ft]
+repo = "unsloth/gemma-4-E4B-it-qat-GGUF"          # the base model, as in its own preset
+revision = "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265"
+file = "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+sha256 = "df0fd4ee..."
+lora_repo = "your-name/gemma-4-e4b-adapter"        # default: repo
+lora_revision = "b1a8f385..."                       # pin it; default: revision, only when lora_repo is unset
+lora_file = "adapter-f16.gguf"
+lora_sha256 = "c8611f84..."
+alias = "gemma-4-E4B-it-qat-UD-Q4_K_XL-ft"
+parallel = 16
+```
+
+For a private repository, set `[huggingface] token` (or `KIS_HUGGINGFACE_TOKEN`) to a read-only token; the kernel exports it as `HF_TOKEN`. The kernel is private by default, and the token travels in its parameters like the tunnel token. An MTP draft model made for the base model still works with an adapter, but its acceptance rate may drop; compare `draft_acceptance` in `kis status` against the base preset.
+
 ## Tunnels
 
 Set `[tunnel] kind` in `config.toml`:

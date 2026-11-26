@@ -3,6 +3,7 @@ import dataclasses
 import pytest
 
 import backends
+from common import Paths
 from kis.schema import EventType, Topology
 from state import Runtime
 
@@ -33,7 +34,7 @@ def fake(server, monkeypatch, tmp_path):
 
     monkeypatch.setattr(backends, "WORK", tmp_path)
     monkeypatch.setattr(backends, "server_binary", lambda: "llama-server")
-    monkeypatch.setattr(backends, "model_files", lambda model: ("model.gguf", None))
+    monkeypatch.setattr(backends, "model_files", lambda model: Paths("model.gguf"))
     monkeypatch.setattr(backends.subprocess, "check_output", lambda *a, **k: "0\n1\n")
     monkeypatch.setattr(backends.os.path, "getsize", lambda p: 3e9)
     monkeypatch.setattr(backends, "gpu_stats", list)
